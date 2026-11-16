@@ -1,0 +1,2628 @@
+"""`/bug-hunt` — an autonomous, self-iterating hunt campaign.
+
+AGENTS.md arms a doctrine but ships no methodology: it says *you are an
+autonomous pentest operator*, not *here is how to run an engagement*. So a lanthorn
+session improvises one pass and stops. `/bug-hunt` supplies the missing loop:
+
+    recon -> plan a wave -> run the wave -> harvest findings -> replan
+
+**One wave per invocation.** The loop is bounded (`max_waves`, default 1), so
+`/bug-hunt host` runs the next wave and stops; `/bug-hunt host --wave 3` runs
+wave 3. The operator decides whether there is a next wave, which is the whole
+point: a campaign that plans wave 2 straight after wave 1 found a critical is
+spending tokens on work nobody asked for and nobody can decline. `/stop-hunt`
+still lands mid-wave — the wave races the `stop` event, so stopping cancels the
+agents rather than waiting out the slowest one.
+
+The shape is deliberately `/team`'s. A read-only planner reads what is known,
+emits a JSON roster of independent briefs, the briefs run concurrently, and the
+results come back as structured text. Two things are different:
+
+*   **The planner sees the findings so far.** `WAVE_PLANNER_PROMPT` carries every
+    finding from every earlier wave, so wave N+1 is aimed at what wave N did not
+    cover rather than re-running the same ten probes. That feedback edge is the
+    whole point of the command; without it this is just `/team` with a bigger
+    roster.
+
+*   **The campaign directory is the scope's, and its waves are directories.** A
+    wave's plan and its findings land together in `<campaign>/wave-<n>/`, so the
+    tree says what each wave aimed at and what it found without anyone reading
+    frontmatter. Recon sits at the top level beside them, one file per recon.
+
+*   **Workers are told to report in JSON.** Every brief ends with the same
+    finding contract, and `parse_findings` reads it back off the worker's final
+    text. That is what makes a wave's output machine-readable enough to feed the
+    next planner.
+
+Like team.py this module holds orchestration and nothing else — no Textual, no
+widgets, no colours. Everything is reported as plain event dicts through an
+`on_event` sink, so the whole campaign is testable without a terminal.
+
+The workers inherit the session's mode, so under `/mode auto-run` they run the
+operator's AGENTS.md doctrine with every tool armed. The wave planner does not:
+it is forced to `plan` mode, because a planner with bash will start doing the
+work itself instead of deciding who should.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import json
+import re
+import shutil
+import time
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Awaitable, Callable
+
+from . import team as team_mod
+from .agent import Agent
+from .config import Config
+
+#: Briefs per wave. All of them run at once — see HUNT_CONCURRENCY.
+HUNT_WAVE_SIZE = 10
+
+#: Workers in flight at any instant. Equal to the wave size by design: the
+#: operator asked for all ten to run simultaneously.
+HUNT_CONCURRENCY = 10
+
+#: How long a turn's event stream may go quiet before the prose produced so far
+#: is flushed to the UI anyway. The planner's turn runs for tens of seconds over
+#: the whole recon before it writes a word of roster, and the wave view has
+#: nothing else to draw for that whole time — so a buffer that only empties on a
+#: tool call leaves the operator staring at an empty screen. Short enough to
+#: feel live, long enough that a streaming model is not flushed mid-sentence on
+#: every token.
+STREAM_IDLE_SECONDS = 0.4
+
+#: Severity spellings a model reaches for, mapped onto the four we accept.
+_SEVERITY_ALIASES = {
+    "crit": "critical",
+    "severe": "critical",
+    "moderate": "medium",
+    "med": "medium",
+    "low": "low",
+    "info": "info",
+    "informational": "info",
+    "note": "info",
+    "none": "info",
+}
+
+VALID_SEVERITIES = ("critical", "high", "medium", "low", "info")
+
+#: Ordered worst-first, so a wave's findings can be sorted for display.
+SEVERITY_ORDER = {s: i for i, s in enumerate(VALID_SEVERITIES)}
+
+_SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+# ---------------------------------------------------------------------------
+# The finding contract
+# ---------------------------------------------------------------------------
+# Appended to every brief and every planner prompt. One contract, stated once,
+# so a worker cannot invent its own report shape and the parser has exactly one
+# thing to read.
+
+FINDING_CONTRACT = """\
+REPORTING
+---------
+Report each confirmed vulnerability TWICE, and the first time is the one that
+matters:
+
+1. THE MOMENT YOU CONFIRM IT — call the ``report_finding`` tool. Do this as soon
+   as you have the evidence in hand, in the same turn you got it, before you go
+   on to the next thing. This is a live engagement: the operator is watching a
+   tracker that fills in as you work, and a finding reported here appears on it
+   within a second. A finding you sit on until the end of your turn is a finding
+   the operator spends that whole time not knowing about.
+
+   Report a bug you confirm even if you have not finished exploiting it — an
+   error that proves injection, a response that proves missing access control, a
+   banner that proves an old vulnerable version. Evidence of the weakness is
+   what counts, not a finished exploit.
+
+2. AGAIN IN YOUR FINAL MESSAGE — end it with ONE JSON object on its own lines,
+   wrapped in a ```json fence:
+
+```json
+{"findings": [{"title": "short name for the bug",
+               "severity": "critical|high|medium|low|info",
+               "asset": "the host, URL or path affected",
+               "summary": "what the bug is, in two or three sentences",
+               "evidence": "the exact request, output or file:line that proves it",
+               "remediation": "how to fix it"}]}
+```
+
+Rules for both:
+- One entry per distinct bug, and the same bug is the same bug in both places.
+  The two are reconciled by title and asset, so repeating yourself costs
+  nothing; reporting the same bug under two different names inflates the count.
+- If you found nothing, call no tool and omit the block entirely (or send
+  `{"findings": []}`) — do not invent a finding to fill either one.
+- `severity` must be one of the five words above. Judge it honestly: a
+  theoretical weakness with no demonstrated impact is `low`, not `critical`.
+- `evidence` must be something you actually observed, not something you expect.
+  A finding with no evidence is a guess and will be discarded. ``report_finding``
+  refuses a report with no evidence, which is deliberate.
+- Put nothing after the final JSON block. Anything you want to say, say before it.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+RECON_PROMPT = """\
+You are opening a security engagement against a declared, authorised target.
+
+TARGET: {target}
+
+This is the RECON phase. Map the target before anyone attacks it. Do not attempt
+exploitation here — that is the next phase, and a recon run that stops early to
+try a payload has failed at its actual job.
+
+Work with the tools you have. Establish, as far as you can:
+
+- Reachability: does it answer, on which schemes and ports, behind what?
+- Surface: what hosts, paths, endpoints, parameters and API roots are exposed?
+- Technology: server, framework, language, CDN, auth scheme, from headers,
+  cookies, error pages, robots.txt, well-known paths and asset naming.
+- Entry points: forms, upload endpoints, login flows, redirect parameters,
+  anything that takes input.
+- Hypotheses: the specific classes of bug this stack plausibly has, and which
+  asset each would live on.
+- Tooling: which offensive tools are actually present on THIS host, and whether
+  a wordlist is available. Check for at least: nmap, ffuf, gobuster,
+  feroxbuster, nikto, sqlmap, nuclei, whatweb, wafw00f, testssl.sh, sslyze,
+  curl, dig, host, nslookup, openssl. Also check the usual wordlist roots
+  (/usr/share/wordlists, /usr/share/seclists/Discovery/Web-Content). One
+  `which` over the whole list, then `ls` on the wordlist roots — this is worth
+  a turn, because a brief that sends an agent after a binary that is not
+  installed wastes the agent entirely, and ten agents each re-checking for
+  themselves wastes the wave.
+
+Be concrete. A hypothesis that names a host and a parameter is worth ten that
+name a category. If the target does not answer at all, say so plainly and report
+what you tried — that is a real result, not a failure.
+
+Finish with a short written brief: what the target is, what you could reach,
+what you could not, and your ranked hypotheses for where the bugs are.
+
+{contract}
+"""
+
+WAVE_PLANNER_PROMPT = """\
+You are directing a security engagement against a declared, authorised target.
+Your job is to decide what the NEXT wave of {wave_size} agents should each do.
+
+TARGET: {target}
+
+WHAT IS KNOWN
+-------------
+{recon}
+{recon_note}
+WHAT HAS ALREADY BEEN FOUND
+---------------------------
+{findings}
+
+WAVE HISTORY
+------------
+{waves}
+
+You have READ-ONLY tools. Use them to check a hypothesis before you brief an
+agent on it — enough to know the asset is real and the brief is not a guess —
+but do not attempt the work itself. That is what the agents are for.
+
+Rules:
+- Return AT MOST {wave_size} workers. Fewer is better than padding.
+- Every brief must be INDEPENDENT: no agent may depend on another's output,
+  because they all run at the same time and cannot talk to each other.
+- Do not repeat work already done. Read the findings and the wave history and
+  aim at what is still open. If an earlier finding suggests a follow-up — a
+  different endpoint of the same service, a second parameter, a bypass of the
+  same control — that is the highest-value brief you can write.
+- If an earlier finding was marked low-confidence or a worker failed, a brief
+  that re-tests it properly is worth a slot.
+- Spread the wave across different bug classes. Ten briefs that all test
+  injection waste nine slots. The classes worth covering, roughly in order of
+  how often they pay: broken access control, authentication and session flaws,
+  injection, business-logic abuse, sensitive-data exposure, misconfiguration,
+  input validation, race conditions, crypto and transport, and the dependency
+  and supply chain.
+- Each worker gets a short lowercase `name` (e.g. "auth-bypass") and a `brief`
+  that is a complete, self-contained instruction. The worker sees the brief and
+  nothing else — it must say what to test, on which asset, and how to prove it.
+- `owns` is the asset, endpoint or vector that brief is responsible for. Two
+  workers must not claim the same one; the wave is deduplicated on this.
+
+Reply with ONE JSON object and nothing else:
+
+{{"summary": "one line on how you are reading the target now",
+  "workers": [{{"name": "short-name",
+               "brief": "the full instruction for this agent",
+               "owns": ["the asset or vector it owns"]}}]}}
+
+{contract}
+"""
+
+#: Inserted into the planner prompt when the recon above was inherited from an
+#: earlier campaign rather than run now. The planner has read-only tools and is
+#: told to check a hypothesis before briefing an agent on it, so the honest move
+#: is to say the map may be out of date and let it re-verify what it is about to
+#: build on — a target that has moved under a stale map sends a whole wave at
+#: assets that no longer exist.
+RECON_INHERITED_NOTE = """\
+
+NOTE: the mapping above was NOT taken now. It is the recon recorded for this
+scope by an earlier campaign, {age_days} day(s) ago. Treat it as a starting
+point, not as ground truth: before you brief an agent on an asset, check that
+the asset is still there and still answers. The surface may have changed.
+"""
+
+#: Appended to the planner prompt for one retry, after a reply that could not be
+#: parsed. Deliberately blunt: the failure mode is almost always a model that
+#: wrapped its JSON in prose or a fence, and saying so plainly fixes it.
+PLANNER_RETRY_NUDGE = """\
+Your previous reply could not be read as JSON. Reply with ONE JSON object and
+nothing else — no prose before it, no prose after it, no code fence around it.
+Start your reply with `{` and end it with `}`.
+"""
+
+
+SUMMARY_PROMPT = """\
+An engagement against a target has been running as a sequence of waves of
+parallel agents. Write the closing report.
+
+TARGET: {target}
+WAVES RUN: {waves}
+
+RECON
+-----
+{recon}
+
+EVERY FINDING, IN THE ORDER THEY WERE CONFIRMED
+-----------------------------------------------
+{findings}
+
+Write the report the operator will actually read. It must cover, in this order:
+
+1. **What was tested** — the ground covered, wave by wave, in plain language.
+   Not a list of agent names; a description of the attack surface that was
+   actually exercised.
+2. **What was found** — each confirmed finding, worst first, with its severity
+   and the evidence that proves it. Be precise about impact. If something was
+   reported by an agent but the evidence does not hold up, say so and say why.
+3. **What is worth checking next** — the specific, still-open leads, each
+   concrete enough that someone could pick it up and run with it.
+4. **What is not worth the time** — the avenues that were checked and are clean,
+   or that look promising but are dead ends. This section matters as much as the
+   third: it is what stops the next person repeating this engagement.
+
+Be honest about coverage. If a whole class of bug was never tested, say so
+rather than letting silence read as "clean". Do not pad. If the engagement found
+nothing real, the report says that and explains what was ruled out.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Fallback vectors
+# ---------------------------------------------------------------------------
+# Used when the planner's reply cannot be read. A model that rambles should cost
+# the wave its shape, never the wave itself — so the campaign keeps running on a
+# fixed matrix rather than stopping to wait for a human.
+
+HUNT_VECTORS: list[tuple[str, str, str]] = [
+    (
+        "access-control",
+        "Broken access control. Enumerate every endpoint and object reference you "
+        "can reach and test whether an unauthenticated or lower-privileged "
+        "request can reach it: IDOR on object ids, forced browsing to admin "
+        "paths, HTTP method tampering, missing function-level checks. Prove each "
+        "with the exact request and response.",
+        "access control",
+    ),
+    (
+        "auth-session",
+        "Authentication and session handling. Probe login for user enumeration, "
+        "credential stuffing resistance, lockout, password-reset flow flaws and "
+        "token predictability. Inspect session cookies for missing HttpOnly / "
+        "Secure / SameSite, weak entropy, and whether logout actually invalidates "
+        "the session server-side.",
+        "authentication",
+    ),
+    (
+        "injection",
+        "Injection. Test every input you found — query parameters, form fields, "
+        "headers, cookies, JSON bodies — for SQL, NoSQL, command, template and "
+        "LDAP injection. Use safe, non-destructive probes first and escalate only "
+        "on a positive signal. Report the payload and the evidence of execution.",
+        "injection",
+    ),
+    (
+        "business-logic",
+        "Business logic. Walk the application's real workflows and look for ways "
+        "to abuse them: skipping steps, replaying a one-time action, negative or "
+        "overflowing quantities, price or role tampering in a request body, "
+        "self-approval, and race windows in anything that should happen once.",
+        "business logic",
+    ),
+    (
+        "data-exposure",
+        "Sensitive data exposure. Look for secrets and personal data where they "
+        "should not be: verbose errors and stack traces, debug endpoints, source "
+        "maps, .git and backup files, directory listings, API responses that "
+        "return more fields than the UI shows, and credentials in client-side "
+        "bundles.",
+        "data exposure",
+    ),
+    (
+        "misconfiguration",
+        "Security misconfiguration. Check TLS and certificate validity, security "
+        "headers (CSP, HSTS, X-Frame-Options, X-Content-Type-Options), CORS "
+        "policy including credentialed origins, default credentials on any "
+        "admin surface, exposed management or metrics ports, and permissive "
+        "file-upload handling.",
+        "misconfiguration",
+    ),
+    (
+        "input-validation",
+        "Input validation and client-side trust. Test for reflected and stored "
+        "XSS, HTML injection, open redirects, SSRF via any URL-shaped parameter, "
+        "path traversal in file parameters, XXE in any XML endpoint, and "
+        "deserialization of attacker-controlled data.",
+        "input validation",
+    ),
+    (
+        "race-conditions",
+        "Race conditions and state. Find operations that should be atomic — "
+        "coupon redemption, transfers, invites, rate limits, vote or like "
+        "counters — and fire them concurrently to test for double-spend, limit "
+        "bypass and inconsistent state. Report the timing evidence, not just the "
+        "outcome.",
+        "race conditions",
+    ),
+    (
+        "crypto-transport",
+        "Cryptography and transport. Assess the TLS configuration and cipher "
+        "suites, check for mixed content and downgrade paths, examine how tokens "
+        "and password hashes are constructed and whether they are reversible, "
+        "and look for predictable randomness in anything security-relevant.",
+        "crypto",
+    ),
+    (
+        "dependencies",
+        "Dependency and supply chain. Fingerprint the components the target "
+        "serves or references — JS libraries, frameworks, server banners, "
+        "package manifests if reachable — and identify versions with known "
+        "vulnerabilities. Confirm exploitability against this deployment rather "
+        "than reporting a bare version match.",
+        "dependencies",
+    ),
+]
+
+
+def fallback_roster(wave: int, wave_size: int = HUNT_WAVE_SIZE,
+                    kind: "CampaignKind | None" = None) -> team_mod.Roster:
+    """A fixed matrix roster, used when the planner's reply cannot be read."""
+    vectors = (kind.vectors if kind is not None and kind.vectors else HUNT_VECTORS)
+    workers = [
+        team_mod.WorkerSpec(name=name, brief=brief, owns=[owns])
+        for name, brief, owns in vectors[:wave_size]
+    ]
+    return team_mod.Roster(
+        summary=f"planner reply unreadable — falling back to the fixed vector "
+                f"matrix for wave {wave}",
+        workers=workers,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Campaign kinds
+# ---------------------------------------------------------------------------
+# Everything about an engagement that is NOT the engine: the prompts, the
+# fallback vectors, the directory prefix, and the interlock that guards the
+# tools. `run_hunt` below is the loop — recon, plan, run, harvest, report — and
+# it is identical for every kind. `/ad` is a second *doctrine*, not a second
+# engine, so it is expressed as one of these rather than as a fork of the loop.
+#
+# The defaults reproduce today's `/bug-hunt` exactly: `HUNT_KIND` carries the
+# module constants verbatim, so a caller that passes no kind gets byte-identical
+# prompts and the same campaign directory it has always had. That equivalence is
+# asserted in test_hunt.py rather than assumed, because it is the property that
+# makes the whole refactor safe.
+
+
+@dataclass(frozen=True)
+class CampaignKind:
+    """One doctrine the campaign engine can run."""
+
+    #: Short name, written into each plan's frontmatter so a campaign read back
+    #: off disk knows which doctrine produced it.
+    name: str = "hunt"
+    #: The slash command that starts this doctrine, without the leading slash.
+    #: Used wherever a message has to tell the operator what to run — a refusal
+    #: that says ``/bug-hunt corp.local`` over an AD campaign sends them to the
+    #: wrong command, and the wrong command here means a *different campaign
+    #: directory*, so they would find an empty scope and conclude the run was
+    #: lost.
+    command: str = "bug-hunt"
+    #: Prepended to the scope slug when naming the campaign directory. Empty for
+    #: `/bug-hunt`, so its directories are unchanged; `ad-` for AD, so an AD
+    #: campaign on `corp.local` and a web hunt on `corp.local` cannot collide.
+    dir_prefix: str = ""
+    recon_prompt: str = RECON_PROMPT
+    planner_prompt: str = WAVE_PLANNER_PROMPT
+    contract: str = FINDING_CONTRACT
+    summary_prompt: str = SUMMARY_PROMPT
+    #: Fallback roster vectors. Empty means use `HUNT_VECTORS`.
+    vectors: tuple = ()
+    #: A tool hook run immediately before every tool call, alongside the write
+    #: lock. This is where `/ad` installs its throttle and circuit breaker. None
+    #: for every existing caller, which is what makes the seam free.
+    interlock: Callable[[str, dict], object] | None = None
+
+
+#: The default kind: `/bug-hunt`, exactly as it shipped.
+HUNT_KIND = CampaignKind()
+
+
+#: How much of the recon report is prepended to every worker brief. Generous,
+#: because the alternative is ten agents re-reading the same files to find it.
+BRIEF_CONTEXT_CHARS = 6000
+
+
+def brief_context(run: HuntRun, limit: int = BRIEF_CONTEXT_CHARS) -> str:
+    """The shared briefing prepended to every worker's brief.
+
+    A worker used to see only its own brief, so all ten would open with the same
+    ``pwd && ls -la`` and the same re-read of every recon file — a whole wave
+    spending its first turns rediscovering what recon already knew. This hands
+    each of them the same picture up front and says, plainly, not to go looking
+    for it again.
+
+    Trimmed from the *end*: a recon report leads with reachability and surface
+    and trails into hypotheses, so the head is the part that saves the most
+    work. The full text still reaches the planner and the closing summary, which
+    see ``run.recon`` directly.
+    """
+    recon = (run.recon or "").strip()
+    if not recon:
+        return ""
+    if len(recon) > limit:
+        recon = recon[:limit].rstrip() + "\n…(recon report truncated here)"
+    return (
+        "WHAT IS ALREADY KNOWN\n"
+        "---------------------\n"
+        "Recon has already mapped this target. The findings below are "
+        "established fact — do not spend a turn re-deriving any of it. In "
+        "particular, do not re-run `ls`, `pwd`, or re-read the same recon "
+        "files: that ground is covered, and the wave is timed.\n\n"
+        f"{recon}\n\n"
+        "If the recon report names the tooling available on this host, treat "
+        "that as the tooling you have. Do not probe for binaries it says are "
+        "absent.\n"
+        "---------------------"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Findings
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Finding:
+    """One confirmed bug, as the worker reported it."""
+
+    wave: int
+    agent: str
+    title: str
+    severity: str
+    asset: str = ""
+    summary: str = ""
+    evidence: str = ""
+    remediation: str = ""
+    #: True for a finding earlier work confirmed and this run loaded to seed its
+    #: tracker — a prior campaign's, or a prior wave's. Carried findings are
+    #: shown and fed to the planner, but they are not this run's work: the
+    #: closing counts exclude them and the digest marks them. Kept as a field
+    #: rather than inferred from `wave`, because a carried finding keeps the wave
+    #: number it was found in, which collides with this run's own waves.
+    carried: bool = False
+
+    @property
+    def saved(self) -> bool:
+        """Whether this earns a report file.
+
+        Always true. This used to gate on ``SAVE_SEVERITIES`` — critical, high
+        and medium earned an artefact and low/info did not — but a low finding
+        that never reached disk died with the process, and the operator's own
+        `/report-bug-hunt` cannot cite evidence that was never written down. The
+        severity is in the file's name and its frontmatter, so filtering the
+        quiet ones is a read-time decision now rather than a write-time one.
+
+        Kept as a property rather than dropped, because it is the seam a
+        threshold would go back into, and `_save` and `hunt_end` read it.
+        """
+        return True
+
+
+@dataclass
+class WaveRecord:
+    """What one wave was, as its plan recorded it.
+
+    Read back from ``wave-<n>/plan.md`` by ``load_run``. ``waves`` is the
+    one-line-per-wave history the planner reads and the summary quotes; this is
+    the structured form behind it, so the wave view and the evidence report can
+    say what a wave aimed at without re-parsing a string.
+    """
+
+    number: int
+    agents: int = 0
+    fell_back: bool = False
+    summary: str = ""
+    stamp: str = ""
+
+    def line(self, found: int = 0) -> str:
+        """The one-line digest, in the shape ``HuntRun.waves`` has always used."""
+        return (
+            f"wave {self.number}: {self.agents} agents, "
+            f"{found} finding(s)"
+            + (" (fixed vector fallback)" if self.fell_back else "")
+        )
+
+
+@dataclass
+class HuntRun:
+    """The state of one campaign, handed to the summary and the UI."""
+
+    target: str
+    directory: Path
+    stop: asyncio.Event = field(default_factory=asyncio.Event)
+    wave: int = 0
+    #: Which doctrine produced this campaign — "hunt" or "ad". Read back from
+    #: the plan frontmatter by ``load_run``, and defaulted to "hunt" for every
+    #: campaign written before the field existed, which is all of them.
+    kind: str = "hunt"
+    recon: str = ""
+    findings: list[Finding] = field(default_factory=list)
+    waves: list[str] = field(default_factory=list)
+    #: What each wave was, read back from its plan. Populated by ``load_run``;
+    #: a live run fills ``waves`` as it goes and leaves this empty until the
+    #: campaign is reloaded, because the report is built from an archived run.
+    wave_records: list[WaveRecord] = field(default_factory=list)
+    started: float = field(default_factory=time.time)
+    #: Where ``recon`` came from when a repeat hunt reused notes already on
+    #: disk, and how old they were in seconds. Both None when this campaign ran
+    #: its own recon — which is what lets the UI tell the two apart and say so
+    #: rather than presenting an inherited map as a fresh one.
+    recon_source: Path | None = None
+    recon_age: float | None = None
+    #: How many findings were already on disk when this campaign opened. The
+    #: tracker is seeded with them, so the campaign's own tally is
+    #: ``len(findings) - recon_carried`` and its counts stay honest.
+    recon_carried: int = 0
+
+    @property
+    def reused_recon(self) -> bool:
+        """Whether this campaign inherited its recon rather than mapping."""
+        return self.recon_source is not None
+
+    def digest(self) -> str:
+        """Every finding so far, as the next planner sees it.
+
+        Deliberately terse: the planner needs to know what is closed so it can
+        aim elsewhere, not to re-read the evidence. The full text lives in the
+        report files.
+
+        Findings carried in from earlier work are marked as such, so a planner
+        does not read a bug confirmed weeks ago as one this campaign just
+        closed — the distinction decides whether a brief that re-tests it is
+        redundant or overdue. The label says "earlier wave" rather than "earlier
+        campaign" because the campaign is now the scope's whole history: a
+        second `/bug-hunt` runs one wave on top of the waves already there, so
+        what a wave inherits may be from last week's campaign or from yesterday's
+        wave, and to the planner those are the same thing.
+        """
+        if not self.findings:
+            return "(nothing confirmed yet)"
+        lines = []
+        for f in self.ranked():
+            asset = f" @ {f.asset}" if f.asset else ""
+            line = f"- [{f.severity}] {f.title}{asset} — {f.summary}".rstrip()
+            if f.carried:
+                line += "  (found in an earlier wave)"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def wave_digest(self) -> str:
+        """One line per completed wave, so the planner can see the ground covered."""
+        if not self.waves:
+            return "(this is the first wave)"
+        return "\n".join(self.waves)
+
+    def add_finding(self, f: Finding) -> bool:
+        """Record a finding, deduplicated. Returns whether it was new.
+
+        Ten agents run at once against one target, so the same bug gets reported
+        more than once — "missing HSTS" is a title four different vectors might
+        each land on — and an undeduped tracker would show it four times and
+        inflate every count. Two findings are the same bug when their title
+        slugs and their assets match; the first one wins, because it is the one
+        whose evidence was captured against the asset as originally found.
+
+        The return value is what stops the transcript and the panel
+        double-counting: a repeat is dropped silently rather than announced
+        twice.
+        """
+        key = (_slug(f.title), (f.asset or "").strip().lower())
+        for existing in self.findings:
+            if (_slug(existing.title),
+                    (existing.asset or "").strip().lower()) == key:
+                return False
+        self.findings.append(f)
+        return True
+
+    def ranked(self) -> list[Finding]:
+        """The findings, worst first, then by wave and title.
+
+        One ordering, used by the findings panel, the transcript and the closing
+        summary, so a critical never sorts below an info in one place and above
+        it in another. `wave` breaks severity ties so an early confirmation
+        reads above a late restatement; `title` keeps it stable run to run.
+        """
+        return sorted(
+            self.findings,
+            key=lambda f: (SEVERITY_ORDER.get(f.severity, 9), f.wave, f.title),
+        )
+
+
+def _slug(text: str) -> str:
+    """A short, filesystem-safe label. Never empty."""
+    s = _SLUG_RE.sub("-", str(text or "").strip()).strip("-.")
+    return (s[:64] or "finding").lower()
+
+
+def _iter_json_objects(text: str):
+    """Yield every balanced ``{...}`` span in *text*, string-aware.
+
+    A worker may report several findings in one block or several blocks in one
+    message, so this walks the whole text rather than stopping at the first
+    object the way team._first_json_object does. Brace counting skips braces
+    inside string literals, or an evidence field containing ``{`` would
+    unbalance the scan.
+    """
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        escaped = False
+        for j in range(i, n):
+            ch = text[j]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    yield text[i : j + 1]
+                    i = j + 1
+                    break
+        else:
+            return  # unbalanced from here on; nothing more to read
+
+
+def normalise_severity(raw: str) -> str:
+    """Fold a model's severity spelling onto one of the five we accept."""
+    s = str(raw or "").strip().lower()
+    s = _SEVERITY_ALIASES.get(s, s)
+    return s if s in VALID_SEVERITIES else "info"
+
+
+def parse_findings(text: str, *, wave: int, agent: str) -> list[Finding]:
+    """Read a worker's findings back off its final text.
+
+    Accepts both shapes a model produces: a ``{"findings": [...]}`` envelope, and
+    a bare object that is itself one finding. Anything without a title is
+    dropped — an entry the model could not even name is not a report.
+    """
+    if not text or not text.strip():
+        return []
+
+    out: list[Finding] = []
+    for span in _iter_json_objects(text):
+        try:
+            data = json.loads(span)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        entries = data.get("findings")
+        if not isinstance(entries, list):
+            entries = [data] if data.get("title") else []
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            title = str(entry.get("title", "") or "").strip()
+            if not title:
+                continue
+            out.append(Finding(
+                wave=wave,
+                agent=agent,
+                title=title[:200],
+                severity=normalise_severity(entry.get("severity")),
+                asset=str(entry.get("asset", "") or "").strip()[:300],
+                summary=str(entry.get("summary", "") or "").strip(),
+                evidence=str(entry.get("evidence", "") or "").strip(),
+                remediation=str(entry.get("remediation", "") or "").strip(),
+            ))
+    return out
+
+
+def _finding_markdown(run: HuntRun, f: Finding) -> str:
+    """The body of one finding's report file."""
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return (
+        "---\n"
+        f"target: {run.target}\n"
+        f"wave: {f.wave}\n"
+        f"agent: {f.agent}\n"
+        f"severity: {f.severity}\n"
+        f"asset: {f.asset}\n"
+        f"timestamp: {stamp}\n"
+        "---\n\n"
+        f"# {f.title}\n\n"
+        f"**Severity:** {f.severity}  \n"
+        f"**Asset:** {f.asset or '(not stated)'}  \n"
+        f"**Found by:** {f.agent} (wave {f.wave})\n\n"
+        "## Summary\n\n"
+        f"{f.summary or '(no summary given)'}\n\n"
+        "## Evidence\n\n"
+        f"{f.evidence or '(no evidence recorded)'}\n\n"
+        "## Remediation\n\n"
+        f"{f.remediation or '(no remediation suggested)'}\n"
+    )
+
+
+#: A scope name longer than this is prose, not a hostname. The longest legal
+#: DNS name is 253 octets, but a name worth typing into `/bug-hunt` is nothing
+#: like that long, and the failure this guards is real: an operator typed a
+#: sentence into the target field and got a directory called
+#: ``bdgroup.com-the-recons-are-in-this-directory-pretty-much-you-can-...``.
+SCOPE_NAME_MAX = 80
+
+
+def scope_name(target: str) -> str:
+    """The bare scope a target names — ``https://dev.example.com/login`` →
+    ``dev.example.com``.
+
+    The reduction itself, split out from ``scope_slug`` because two other places
+    need to compare a scope *without* slugging it: ``migrate_hunts`` deciding
+    whether a legacy directory already sits at its own scope, and the
+    ``hunt_findings`` tool matching the scope the operator typed against a
+    campaign directory. Both used to compare raw strings, so ``hunt_findings
+    scope=https://dev.example.com/login`` matched nothing.
+
+    Empty for anything that is not host-shaped enough to reduce, which is the
+    caller's signal to reject it.
+    """
+    text = str(target or "").strip()
+    if not text:
+        return ""
+    # Strip a scheme and anything after the authority, so a URL reduces to its
+    # host. `//` starts the authority; a bare host has none.
+    text = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", text)
+    text = text.split("/", 1)[0]
+    text = text.split("@")[-1]          # drop any userinfo
+    text = text.split(":", 1)[0]        # drop a port
+    return text.lower()
+
+
+def scope_slug(target: str) -> str:
+    """The scope name a target files under. Never empty.
+
+    A target is a host, a domain, a CIDR block or a URL — so the scope is
+    derived from it and reduced to one filesystem-safe label: a scheme and a
+    path are dropped, because ``https://dev.example.com/login`` and
+    ``dev.example.com`` are the same engagement and must not become two
+    directories.
+
+    Anything that does not reduce to something host-shaped is rejected rather
+    than truncated into a misleading name. A sentence in the target field is
+    an operator mistake, and a directory named after its first eighty
+    characters is a mistake preserved on disk; raising lets the caller say so.
+    """
+    text = scope_name(target)
+    if not text:
+        raise ValueError("a hunt needs a target")
+
+    if " " in text:
+        raise ValueError(
+            f"target contains spaces — {target[:60]!r}. /bug-hunt takes one "
+            "host or domain, not a description of what to do."
+        )
+
+    slug = _slug(text)
+    if not slug or slug == "finding":
+        raise ValueError(f"cannot make a scope name out of {target!r}")
+    if len(slug) > SCOPE_NAME_MAX:
+        raise ValueError(
+            f"target looks like a sentence, not a scope — {target[:60]!r}… "
+            f"({len(slug)} characters). /bug-hunt takes one host or domain."
+        )
+    return slug
+
+
+def case_dir(cfg: Config, target: str, kind: "CampaignKind | None" = None) -> Path:
+    """Create and return the campaign directory for *target*'s scope.
+
+    ``<state_dir>/hunts/<prefix><scope>/`` — under state_dir, beside sessions
+    and osint cases rather than in whatever repo the operator happens to be in.
+
+    **One directory per scope, reused.** This used to be ``<slug>-<stamp>``, so
+    every `/bug-hunt` on the same target made a new sibling directory and a
+    campaign against one host scattered itself across a dozen of them — recon
+    notes in one, findings in another, nothing that accumulated. The directory
+    is now the scope's, and the *artefacts* inside it carry the timestamps, so
+    hunting the same target twice adds to its history instead of starting over.
+
+    ``kind.dir_prefix`` keeps two doctrines apart on a target that is both a
+    website and a domain: an AD campaign on ``corp.local`` lands in
+    ``hunts/ad-corp.local/`` while a web hunt on the same name keeps
+    ``hunts/corp.local/``. Without it they would share one directory, and an AD
+    campaign would inherit a web hunt's recon as its own map of a domain
+    controller.
+
+    **Nothing is created but the directory itself.** It used to make
+    ``findings/`` and ``plans/`` up front, which meant a `/bug-hunt` stopped
+    before its first brief left an empty campaign behind and — more to the point
+    — those two directories were the marker ``migrate_hunts`` used to recognise
+    a scope-shaped campaign. The layout is now one directory per wave
+    (``wave-<n>/findings/`` and ``wave-<n>/plan.md``, see ``wave_dir``), so the
+    wave directories are created by ``write_plan`` and ``write_report`` as the
+    waves actually run. See ``is_scope_shaped`` for what replaced the marker.
+    """
+    prefix = kind.dir_prefix if kind is not None else ""
+    d = Path(cfg.state_dir) / "hunts" / f"{prefix}{scope_slug(target)}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+#: A legacy campaign directory: ``<scope>-<YYYYMMDD>-<HHMMSS>``. Matched on the
+#: tail so the scope itself may contain dashes and dots, which every hostname
+#: does. See ``migrate_hunts``.
+_LEGACY_DIR_RE = re.compile(r"^(?P<scope>.+)-(?P<stamp>\d{8}-\d{6})$")
+
+#: A wave directory: ``wave-0``, ``wave-1``, … The number is the wave it holds.
+_WAVE_DIR_RE = re.compile(r"^wave-(\d+)$")
+
+#: The flat layout's two directories, which ``reorganise_waves`` moves into the
+#: wave directories. Kept as names because both are still *read* — see
+#: ``_finding_files`` — so a campaign reorganised by hand, or read before the
+#: boot migration has run, still loads.
+_FLAT_FINDINGS = "findings"
+_FLAT_PLANS = "plans"
+
+
+def wave_dirs(directory: Path) -> list[tuple[int, Path]]:
+    """Every ``wave-<n>/`` in *directory*, as ``(n, path)``, ordered by n.
+
+    Sorted numerically rather than by name, so ``wave-10`` follows ``wave-9``
+    instead of landing between ``wave-1`` and ``wave-2`` the way a lexicographic
+    sort would put it.
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        return []
+    out = []
+    for child in directory.iterdir():
+        if not child.is_dir():
+            continue
+        match = _WAVE_DIR_RE.match(child.name)
+        if match:
+            out.append((int(match.group(1)), child))
+    return sorted(out, key=lambda pair: pair[0])
+
+
+def next_wave_number(directory: Path) -> int:
+    """The wave a fresh `/bug-hunt` on this scope should run next.
+
+    One past the highest wave already on disk, so hunting a scope a second time
+    continues its numbering rather than overwriting the waves it already has.
+    Minimum 1: wave 0 is recon, and recon is never something the operator asks
+    for as a wave.
+    """
+    waves = wave_dirs(directory)
+    return (waves[-1][0] + 1) if waves else 1
+
+
+def wave_dir(directory: Path, wave: int) -> Path:
+    """``<campaign>/wave-<n>/``, created."""
+    d = Path(directory) / f"wave-{wave}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def wave_findings_dir(directory: Path, wave: int) -> Path:
+    """``<campaign>/wave-<n>/findings/``, created."""
+    d = wave_dir(directory, wave) / _FLAT_FINDINGS
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def is_scope_shaped(directory: Path) -> bool:
+    """Whether *directory* is already a one-directory-per-scope campaign.
+
+    Replaces the old ``_SCOPE_MARKER = "plans"`` check, which stopped meaning
+    anything the moment ``plans/`` moved inside the wave directories: a
+    scope-shaped campaign no longer has a top-level ``plans/``, so the old
+    marker would have called every one of them legacy and tried to migrate them
+    again — and, worse, ``migrate_hunts`` *creates* the marker on a directory
+    whose name is already its own scope, so the re-run would have littered a
+    ``plans/`` back into campaigns that had just been reorganised.
+
+    A campaign is scope-shaped when it holds a wave directory, or still holds
+    the flat layout's ``plans/`` (which is what every campaign written before
+    the wave layout has, and what ``migrate_hunts`` itself creates).
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        return False
+    if (directory / _FLAT_PLANS).is_dir():
+        return True
+    return bool(wave_dirs(directory))
+
+
+def _finding_files(directory: Path) -> list[Path]:
+    """Every finding report in a campaign, in wave order then by name.
+
+    Reads both layouts: ``wave-<n>/findings/*.md`` and the flat
+    ``findings/*.md`` the pre-wave campaigns used. Both are read rather than
+    only the new one because the reader is what the boot migration cannot be
+    relied on to have run before — an operator who opens `/findings` while the
+    migration is still pending, or who reorganises a campaign by hand, still
+    gets their findings instead of an empty panel.
+    """
+    directory = Path(directory)
+    out: list[Path] = []
+    for _, wave_path in wave_dirs(directory):
+        out.extend(sorted((wave_path / _FLAT_FINDINGS).glob("*.md")))
+    flat = directory / _FLAT_FINDINGS
+    if flat.is_dir():
+        out.extend(sorted(flat.glob("*.md")))
+    return out
+
+
+def _plan_files(directory: Path) -> list[Path]:
+    """Every wave plan in a campaign, newest layout and legacy alike.
+
+    ``wave-<n>/plan.md`` is the current shape; ``plans/wave-<n>-<stamp>.md`` is
+    what the flat layout wrote and what ``reorganise_waves`` has not yet moved.
+    Sorted by filename, which orders ``plan.md`` before ``plan-2.md`` — a
+    deliberately re-run wave's second plan reads after its first.
+    """
+    directory = Path(directory)
+    out: list[Path] = []
+    for _, wave_path in wave_dirs(directory):
+        out.extend(sorted(wave_path.glob("plan*.md")))
+    flat = directory / _FLAT_PLANS
+    if flat.is_dir():
+        out.extend(sorted(flat.glob("wave-*.md")))
+    return out
+
+
+def _campaign_scope(directory: Path) -> str:
+    """The scope a campaign directory belongs under.
+
+    Read from the findings' own frontmatter ``target`` where there is one,
+    because the directory *name* is exactly what was wrong: a legacy directory
+    is named after whatever the operator typed, so the sentence
+    ``bdgroup.com-the-recons-are-in-this-directory-...`` is a name, not a scope.
+    The findings recorded the real target, so they decide where the campaign
+    files. Falls back to the directory's own name, which is correct for
+    everything written after the scope change.
+    """
+    for path in _finding_files(directory):
+        try:
+            target = _read_frontmatter(
+                path.read_text(encoding="utf-8", errors="replace")).get("target", "")
+        except OSError:
+            continue
+        if target:
+            try:
+                return scope_slug(target)
+            except ValueError:
+                # The finding recorded prose too. The directory name is all
+                # there is left to go on, and it is better than dropping the
+                # campaign — a wrong scope is recoverable by hand, a deleted
+                # campaign is not.
+                break
+    match = _LEGACY_DIR_RE.match(directory.name)
+    return scope_name(match.group("scope") if match else directory.name)
+
+
+def migrate_hunts(cfg: Config) -> list[tuple[Path, Path]]:
+    """Fold legacy ``<scope>-<stamp>/`` campaigns into one directory per scope.
+
+    The old layout made a new sibling directory for every `/bug-hunt`, so a
+    single engagement scattered across a dozen of them — recon notes in one,
+    findings in another, nothing that accumulated — and a target typed as prose
+    became a directory named after its first eighty characters. This merges
+    those into ``<scope>/`` so every campaign on a host sits together.
+
+    A campaign is a directory under ``hunts/`` that is not ``is_scope_shaped``:
+    a scope-shaped campaign holds wave directories (or the flat layout's
+    ``plans/``), and the legacy ``<scope>-<stamp>`` layout held neither. Files
+    move only when the destination does not already hold that name, so a
+    campaign migrated twice is a no-op and a genuinely different finding with
+    the same filename is kept rather than overwritten. Empty legacy directories
+    are removed; a non-empty one is left alone rather than guessed at.
+
+    Returns the ``(source, destination)`` pairs that moved.
+    """
+    root = Path(cfg.state_dir) / "hunts"
+    if not root.is_dir():
+        return []
+
+    moved: list[tuple[Path, Path]] = []
+    for directory in sorted(root.iterdir()):
+        if not directory.is_dir() or is_scope_shaped(directory):
+            continue
+        scope = _campaign_scope(directory)
+        if scope == directory.name:
+            # Nothing to move it to — it is already its own scope, or its name
+            # is the best identity available. Mark it so the next call skips it.
+            # `reorganise_waves` will give it its wave directories.
+            (directory / _FLAT_PLANS).mkdir(exist_ok=True)
+            continue
+
+        files = [p for p in sorted(directory.rglob("*")) if p.is_file()]
+        if not files:
+            # A campaign that recorded nothing — a `/bug-hunt` stopped before
+            # recon wrote anything. Removing it is the whole migration; making
+            # an empty scope directory for it would just add clutter, and
+            # reporting it as moved would be a lie.
+            try:
+                shutil.rmtree(directory)
+            except OSError:
+                pass
+            continue
+
+        dest = root / scope
+        (dest / _FLAT_FINDINGS).mkdir(parents=True, exist_ok=True)
+        (dest / _FLAT_PLANS).mkdir(parents=True, exist_ok=True)
+
+        landed = 0
+        for src in files:
+            target = dest / src.relative_to(directory)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                continue
+            try:
+                shutil.move(str(src), str(target))
+            except OSError:
+                continue
+            landed += 1
+
+        # Only remove what is actually empty, and only report what moved. A
+        # directory still holding a file — one whose name collided at the
+        # destination and was deliberately kept — stays on disk for the
+        # operator rather than being deleted on a guess, and is not announced
+        # as migrated, because it was not.
+        try:
+            if not [p for p in directory.rglob("*") if p.is_file()]:
+                shutil.rmtree(directory)
+        except OSError:
+            pass
+        if landed:
+            moved.append((directory, dest))
+    return moved
+
+
+def reorganise_waves(cfg: Config) -> list[tuple[Path, Path]]:
+    """File a flat campaign's artefacts into per-wave directories.
+
+    The flat layout put every wave's findings in one ``findings/`` and every
+    wave's plan in ``plans/``, so a three-wave campaign was 43 findings in a
+    heap whose only link to a wave was a frontmatter line. This moves each
+    finding to ``wave-<its own wave>/findings/`` and each plan to
+    ``wave-<its own wave>/plan.md``, then removes the two flat directories once
+    they are empty.
+
+    The wave number comes from each artefact's own frontmatter, which is why
+    that field was worth writing all along. A finding with no readable ``wave``
+    is left where it is rather than guessed at — a wrong wave is worse than a
+    flat one, because the flat one is obvious.
+
+    Safety properties, mirroring ``migrate_hunts``: move-only, never overwrite
+    an existing destination, never remove a directory that still holds a file,
+    and return the ``(source, destination)`` pairs that actually moved. So a
+    second call is a no-op — it finds no flat directories — and a campaign the
+    operator has reorganised by hand is left exactly as they left it.
+    """
+    root = Path(cfg.state_dir) / "hunts"
+    if not root.is_dir():
+        return []
+
+    moved: list[tuple[Path, Path]] = []
+    for directory in sorted(root.iterdir()):
+        if not directory.is_dir():
+            continue
+        moved.extend(_reorganise_one(directory))
+    return moved
+
+
+def _reorganise_one(directory: Path) -> list[tuple[Path, Path]]:
+    """The per-campaign half of ``reorganise_waves``."""
+    moved: list[tuple[Path, Path]] = []
+
+    # ---- findings, each to its own wave's directory.
+    flat_findings = directory / _FLAT_FINDINGS
+    if flat_findings.is_dir():
+        for src in sorted(flat_findings.glob("*.md")):
+            try:
+                meta = _read_frontmatter(
+                    src.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            raw = meta.get("wave", "").strip()
+            if not raw.isdigit():
+                continue
+            dest_dir = wave_findings_dir(directory, int(raw))
+            target = dest_dir / src.name
+            if target.exists():
+                # The destination already has a file by this name — a wave
+                # re-run, or a finding migrated before. Keep both rather than
+                # destroying either.
+                target = _unique(target)
+            try:
+                shutil.move(str(src), str(target))
+            except OSError:
+                continue
+            moved.append((src, target))
+
+    # ---- plans, ``wave-<n>-<stamp>.md`` to ``wave-<n>/plan.md``.
+    flat_plans = directory / _FLAT_PLANS
+    if flat_plans.is_dir():
+        for src in sorted(flat_plans.glob("wave-*.md")):
+            meta = _read_frontmatter(
+                src.read_text(encoding="utf-8", errors="replace"))
+            number = _as_int(meta.get("wave"), -1)
+            if number < 0:
+                continue
+            target = _unique(wave_dir(directory, number) / "plan.md")
+            try:
+                shutil.move(str(src), str(target))
+            except OSError:
+                continue
+            moved.append((src, target))
+
+    # ---- only what is empty. A flat directory still holding a file — one whose
+    # frontmatter named no wave, or whose move failed — stays for the operator.
+    for name in (_FLAT_FINDINGS, _FLAT_PLANS):
+        d = directory / name
+        try:
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+        except OSError:
+            pass
+    return moved
+
+
+def _stamp() -> str:
+    """A sortable timestamp for an artefact's name, e.g. ``20261010-025510``.
+
+    Filename-safe, local time, and lexicographically ordered, which is what lets
+    a campaign directory's artefacts sort into the order they were written. The
+    same shape `/osint` and `/phish` use for their case directories, so one
+    convention covers every dated thing this tool writes.
+    """
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+def write_recon(run: HuntRun, text: str) -> Path | None:
+    """Write recon's report to ``<run.directory>/recon-<stamp>.md``.
+
+    Recon used to live only in ``run.recon`` — the attribute the planner reads
+    and the summary prompt quotes — so it died with the process. A campaign that
+    spent minutes mapping a target left no record of what it saw, and the
+    operator's `/summary-hunt` after a restart said "recon produced nothing"
+    while the recon itself had been the most informative part of the run. This
+    is the record: notes accumulate in the campaign directory, one file per
+    recon, so hunting the same scope twice keeps both.
+
+    Returns None when there is nothing to write, or the path when there is.
+    Best-effort like ``_save``: a campaign must not die because a file could not
+    be written, and the text is in the transcript either way.
+    """
+    if not text.strip():
+        return None
+    body = (
+        "---\n"
+        f"target: {run.target}\n"
+        "wave: 0\n"
+        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+        "---\n\n"
+        f"# Recon — {run.target}\n\n"
+        f"{text.strip()}\n"
+    )
+    try:
+        run.directory.mkdir(parents=True, exist_ok=True)
+        path = _unique(run.directory / f"recon-{_stamp()}.md")
+        path.write_text(body, encoding="utf-8")
+    except OSError:
+        return None
+    return path
+
+
+def write_plan(run: HuntRun, wave: int, roster: team_mod.Roster,
+               raw: str, fell_back: bool) -> Path | None:
+    """Write a wave's plan to ``<run.directory>/wave-<n>/plan.md``.
+
+    The roster the planner returned is the only statement of what a wave was
+    *supposed* to do, and it used to exist only as a UI event — gone the moment
+    the screen moved on. Keeping it is what makes a campaign legible afterwards:
+    why ten agents went where they went, and which briefs came back empty.
+
+    It sits in the wave's own directory, beside the findings that wave produced,
+    so the tree answers "what did wave 2 do, and what did it find" without
+    reading a frontmatter field. There is no timestamp in the name any more —
+    the wave number already makes it unique within the campaign; a deliberately
+    re-run wave gets ``plan-2.md`` from ``_unique``, so both plans survive.
+
+    ``raw`` is the planner's own reply, written only when it could not be read
+    as a roster. That is the diagnostic case — the fixed matrix ran instead, and
+    what the model actually said is the only way to tell a malformed object from
+    an empty turn from a prompt that needs rewriting.
+    """
+    lines = [
+        "---",
+        f"target: {run.target}",
+        f"wave: {wave}",
+        f"agents: {len(roster.workers)}",
+        f"fell_back: {'true' if fell_back else 'false'}",
+        # Which doctrine produced this plan. Read back by ``load_run`` so a
+        # campaign knows what it is; written on every plan so a campaign whose
+        # waves were produced by different kinds (impossible today, but the
+        # field is the record) still reports the latest honestly.
+        f"kind: {run.kind}",
+        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
+        "---",
+        "",
+        f"# Wave {wave} — {len(roster.workers)} agents",
+        "",
+        roster.summary or "(no summary given)",
+        "",
+        "## Roster",
+        "",
+    ]
+    for w in roster.workers:
+        owns = ", ".join(w.owns) if w.owns else "(not stated)"
+        lines += [f"### {w.name}", "", f"**Owns:** {owns}", "", w.brief, ""]
+    if fell_back:
+        lines += [
+            "## Planner reply",
+            "",
+            "The planner's reply could not be read as a roster, so the fixed "
+            "vector matrix ran in its place. What it actually said:",
+            "",
+            raw.strip() or "(the planner returned nothing)",
+            "",
+        ]
+    try:
+        plans = wave_dir(run.directory, wave)
+        path = _unique(plans / "plan.md")
+        path.write_text("\n".join(lines), encoding="utf-8")
+    except OSError:
+        return None
+    return path
+
+
+def _unique(path: Path) -> Path:
+    """*path*, or the first ``-2``, ``-3`` … variant that is free.
+
+    A second-resolution timestamp is not unique enough on its own: two artefacts
+    of the same kind can land in the same second — two agents reporting the same
+    title, a summary asked for twice — and the later write would silently
+    destroy the earlier one. Every artefact in a campaign directory goes through
+    here, because "one file per thing" is the whole point of keeping them.
+    """
+    if not path.exists():
+        return path
+    base = path.with_suffix("")
+    n = 2
+    while True:
+        candidate = base.with_name(f"{base.name}-{n}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def write_report(run: HuntRun, f: Finding) -> Path:
+    """Write one finding to ``<run.directory>/wave-<n>/findings/<severity>-<slug>.md``.
+
+    The wave moved out of the filename and into the directory: the finding sits
+    beside the plan that aimed at it, and the name leads with the severity so a
+    ``ls`` of a wave's findings reads worst-first. ``wave`` is still in the
+    frontmatter, which is what ``reorganise_waves`` uses to file a legacy
+    finding under the right wave.
+
+    Two agents in one wave can land on the same title — "missing HSTS" is a
+    title four different vectors might each report — and the slug would be
+    identical, so the second write would silently destroy the first agent's
+    evidence. A numeric suffix keeps every finding's report on disk, which is
+    the whole point of writing them.
+    """
+    base = wave_findings_dir(run.directory, f.wave) / f"{f.severity}-{_slug(f.title)}.md"
+    path = _unique(base)
+    path.write_text(_finding_markdown(run, f), encoding="utf-8")
+    return path
+
+
+def reports_dir(cfg: Config) -> Path:
+    """Where finished campaign summaries are kept, beside the osint reports."""
+    return Path(cfg.state_dir) / "reports"
+
+
+def report_wave_numbers(run: HuntRun) -> list[int]:
+    """The wave numbers a report will print a ``## `` section for.
+
+    A finding's wave counts even when its plan did not survive — a legacy
+    campaign reorganised from the flat layout still gets a section, built from
+    the findings alone, rather than being dropped for want of a plan — so this
+    is the union of the recorded waves and the waves findings were reported in.
+
+    Both the frontmatter count in ``write_summary`` and the ``**Waves:**`` line
+    in ``build_evidence_report`` are this number. They used to be computed
+    separately and drifted: the frontmatter took ``run.wave``, the highest wave
+    *number*, while the body counted sections, so one report said ``waves: 1``
+    at the top and ``**Waves:** 2`` in the body. Two answers in one file, and
+    the reader has no way to know which was meant.
+    """
+    return sorted({f.wave for f in run.findings}
+                  | {r.number for r in run.wave_records})
+
+
+def write_summary(cfg: Config, run: HuntRun, text: str) -> Path:
+    """Archive the closing report.
+
+    Written into the campaign directory first so it sits with the evidence, then
+    copied into ``<state_dir>/reports/`` — the flat, permanent store that
+    outlives the run, the same one `/osint` archives into. The copy is
+    best-effort: the report exists in the campaign directory regardless, so a
+    failed archive must not raise into the UI.
+
+    Both names carry a timestamp. The campaign directory belongs to the *scope*
+    and is reused, so a fixed ``summary.md`` would have a second campaign on the
+    same host silently overwrite the first one's report — the exact loss this
+    layout exists to stop.
+    """
+    stamp = _stamp()
+    # The number of `## ` sections the report will print — the same number the
+    # evidence report's own header carries, from the same helper. See
+    # `report_wave_numbers` for the drift this replaces.
+    waves = len(report_wave_numbers(run))
+    body = (
+        "---\n"
+        f"target: {run.target}\n"
+        f"waves: {waves}\n"
+        f"findings: {len(run.findings)}\n"
+        f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+        "---\n\n"
+        f"{text}\n"
+    )
+    local = _unique(run.directory / f"summary-{stamp}.md")
+    local.write_text(body, encoding="utf-8")
+
+    # The archive copy takes the same suffix as the local one, so the two files
+    # for one report read as a pair rather than as two different reports.
+    suffix = local.stem[len("summary-"):]
+    dest_dir = reports_dir(cfg)
+    dest = _unique(dest_dir / f"hunt-{run.directory.name}-{suffix}.md")
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local, dest)
+    except OSError:
+        return local
+    return dest
+
+
+def build_evidence_report(run: HuntRun) -> str:
+    """The campaign's findings as a professional, evidence-only report.
+
+    Deliberately **not** a model call. `/summary-hunt` is where narrative and
+    remediation live; this is the document an operator hands to whoever has to
+    act on the findings, and its whole value is that every line of it was
+    recorded during the engagement. A model asked to "write up the findings"
+    would paraphrase the evidence — and evidence that has been paraphrased is no
+    longer evidence, it is a claim about evidence. So this is assembled
+    verbatim, and the remediation section is omitted on purpose: it is the fix,
+    not the finding, and mixing the two in one document is how a report starts
+    reading as advocacy.
+
+    One ``## Wave N`` section per wave, in order, each with what the wave aimed
+    at and what it found; then one ``### SEVERITY — title`` block per finding,
+    worst-first, with the recorded evidence quoted unaltered.
+    """
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    ranked = run.ranked()
+    counts: dict[str, int] = {}
+    for f in ranked:
+        counts[f.severity] = counts.get(f.severity, 0) + 1
+    tally = ", ".join(
+        f"{counts[s]} {s}" for s in VALID_SEVERITIES if counts.get(s)
+    ) or "none"
+
+    # One section per wave, in wave order. A finding whose wave has no record —
+    # a legacy campaign reorganised from the flat layout, whose plans did not
+    # survive — still gets a section, built from the findings alone, rather than
+    # being dropped for want of a plan.
+    by_wave: dict[int, list[Finding]] = {}
+    for f in ranked:
+        by_wave.setdefault(f.wave, []).append(f)
+    numbers = report_wave_numbers(run)
+
+    lines = [
+        f"# Bug hunt — {run.target}",
+        "",
+        f"**Target:** {run.target}  ",
+        f"**Generated:** {stamp}  ",
+        # The sections below, counted — not the plans. A wave that was re-run
+        # leaves every plan on disk, so counting plans made this claim "16
+        # waves" over an 11-wave campaign. This is the number of `## ` headings
+        # the reader will find, which is the only thing the line can honestly
+        # promise.
+        f"**Waves:** {len(numbers)}  ",
+        f"**Findings:** {len(ranked)} ({tally})",
+        "",
+        "This report contains only what was recorded during the engagement. "
+        "Evidence is reproduced as captured.",
+        "",
+    ]
+
+    for n in numbers:
+        record = next((r for r in run.wave_records if r.number == n), None)
+        found = by_wave.get(n, [])
+        title = "Recon (wave 0)" if n == 0 else f"Wave {n}"
+        lines += ["", f"## {title}", ""]
+        if n == 0:
+            lines.append("Findings reported by the reconnaissance phase.")
+        elif record is not None:
+            aimed = record.summary or "(no summary recorded)"
+            lines.append(
+                f"**{record.agents} agent(s)** — {aimed}"
+                + (" _(fixed vector fallback)_" if record.fell_back else "")
+            )
+        else:
+            lines.append("_(no plan recorded for this wave)_")
+        lines.append("")
+
+        if not found:
+            lines += ["No findings recorded for this wave.", ""]
+            continue
+
+        for f in found:
+            lines += [
+                f"### {f.severity.upper()} — {f.title}",
+                "",
+                f"- **Asset:** {f.asset or '(not stated)'}",
+                f"- **Found by:** {f.agent} (wave {f.wave})",
+            ]
+            if f.summary:
+                lines += ["", f.summary, ""]
+            lines += ["**Evidence**", ""]
+            # Verbatim, and fenced so a payload containing markdown — a stack
+            # trace, a dumped config, an injected `<script>` — renders as the
+            # text it is rather than as markup in the operator's viewer.
+            lines += ["```", (f.evidence or "(no evidence recorded)").strip(), "```", ""]
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_evidence_report(cfg: Config, run: HuntRun) -> Path | None:
+    """Write the evidence report beside the campaign, and archive a copy.
+
+    Same two-step as ``write_summary``: into the campaign directory so it sits
+    with the artefacts it cites, then a copy into ``<state_dir>/reports/`` so
+    the deliverable outlives the campaign directory. Returns the archived path,
+    the campaign path when the archive copy failed, or None when there was
+    nothing to report.
+    """
+    if not run.findings:
+        return None
+    stamp = _stamp()
+    body = build_evidence_report(run)
+    local = _unique(Path(run.directory) / f"report-{stamp}.md")
+    local.write_text(body, encoding="utf-8")
+
+    dest_dir = reports_dir(cfg)
+    dest = _unique(dest_dir / f"hunt-report-{Path(run.directory).name}-{stamp}.md")
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local, dest)
+    except OSError:
+        return local
+    return dest
+
+
+# ---------------------------------------------------------------------------
+# Running
+# ---------------------------------------------------------------------------
+
+def _finding_from_tool(meta: dict, *, wave: int, agent: str) -> Finding | None:
+    """A finding an agent reported through ``report_finding``, as a Finding.
+
+    The tool hands its payload back on the result's ``meta`` rather than
+    writing anything itself (see ``tools._tool_report_finding``), so this is
+    where a tool call becomes a first-class finding. Shaped to match what
+    ``parse_findings`` produces, so the two paths are indistinguishable once
+    the finding is in the run — which is what lets dedupe reconcile them.
+    """
+    data = (meta or {}).get("finding")
+    if not isinstance(data, dict):
+        return None
+    title = str(data.get("title", "") or "").strip()
+    if not title:
+        return None
+    return Finding(
+        wave=wave,
+        agent=agent,
+        title=title[:200],
+        severity=normalise_severity(data.get("severity")),
+        asset=str(data.get("asset", "") or "").strip()[:300],
+        summary=str(data.get("summary", "") or "").strip(),
+        evidence=str(data.get("evidence", "") or "").strip(),
+        remediation=str(data.get("remediation", "") or "").strip(),
+    )
+
+
+async def _report_live(run: HuntRun, f: Finding,
+                       on_event: Callable[[dict], Awaitable[None]]) -> None:
+    """Record and announce a finding the instant an agent reports it.
+
+    This is the whole point of the tool: the operator's tracker updates while
+    the wave is still running, instead of at the end of it. Deduplicated
+    through ``run.add_finding``, so the mid-turn report and the same bug
+    restated in the agent's final text are one finding — the harvest after the
+    wave then has nothing new to add for anything already published here.
+    """
+    if not run.add_finding(f):
+        return
+    await on_event({"type": "hunt_finding", "finding": _finding_dict(f),
+                    "saved": _save(run, f)})
+
+
+async def _run_agent(
+    spec: team_mod.WorkerSpec,
+    index: int,
+    cfg: Config,
+    *,
+    on_event: Callable[[dict], Awaitable[None]],
+    agent_factory: Callable[..., Agent],
+    tool_hook,
+    context: str = "",
+    contract: str = "",
+    wave: int = 0,
+    run: HuntRun | None = None,
+) -> team_mod.WorkerResult:
+    """Run one hunt agent to completion. Never raises except on cancellation.
+
+    A near-copy of team._run_worker, and deliberately so: that one emits
+    ``team_*`` events, and a hunt agent's events carry a different payload (the
+    wave, the pane slot). The shared machinery — the write lock, the digest, the
+    touched-path extraction — is imported from team rather than duplicated.
+
+    ``context`` is the shared recon digest, prepended to the brief. Without it
+    every agent starts blind and spends its first turns re-deriving what recon
+    already established — ten agents running the same ``ls`` and reading the
+    same six files — which is most of a wave's budget spent on nothing.
+
+    ``contract`` is the finding-reporting block, appended *after* the brief so
+    it is the last thing the agent reads before it answers. It has to be here
+    and not only on the planner: a worker is the only one that runs a test, so
+    it is the only one that can report what the test found. Without it the agent
+    narrates a methodology, ``parse_findings`` reads no JSON, and the whole wave
+    reports nothing no matter what it actually discovered.
+    """
+    result = team_mod.WorkerResult(spec=spec)
+
+    # Its own Config copy, so each agent gets its own Scope and its own
+    # cfg._scope — see team.py's module docstring for why sharing one clobbers
+    # the scope guard. The mode is inherited: under /mode auto-run these agents run
+    # the operator's AGENTS.md doctrine with every tool armed.
+    #
+    # can_report arms report_finding for this agent. It is a hunt agent, so it
+    # has a tracker to report into; nothing outside a hunt does. can_hunt_read is
+    # the other way round: this agent must not read the campaign it is part of,
+    # because its brief is deliberately independent of the other agents'.
+    agent_cfg = dataclasses.replace(cfg)
+    worker = agent_factory(agent_cfg, tool_hook=tool_hook, can_report=True,
+                           can_hunt_read=False)
+
+    await on_event({"type": "hunt_agent_start", "name": spec.name, "index": index,
+                    "brief": spec.brief})
+
+    buf: list[str] = []
+
+    async def flush() -> None:
+        text = "".join(buf).strip()
+        buf.clear()
+        if text:
+            await on_event({"type": "hunt_agent_text", "name": spec.name, "text": text})
+
+    # Order matters: the shared context first, then the brief, then the contract
+    # last — the reporting block is what the agent should be holding in mind as
+    # it writes its final message.
+    prompt = f"{context}\n\n{spec.brief}" if context else spec.brief
+    if contract:
+        prompt = f"{prompt}\n\n{contract}"
+
+    try:
+        async for ev in worker.run_turn(prompt):
+            etype = ev.get("type")
+            if etype == "text_delta":
+                buf.append(ev.get("text", ""))
+            elif etype == "tool_call":
+                # Flush first, so the agent's reasoning lands above the call it
+                # explains rather than after it.
+                await flush()
+                await on_event({"type": "hunt_agent_tool", "name": spec.name,
+                                "tool": ev.get("name", ""), "args": ev.get("args") or {}})
+            elif etype == "tool_result":
+                result.touched.extend(
+                    team_mod._touched_paths(ev.get("name", ""), ev.get("args") or {})
+                )
+                await on_event({
+                    "type": "hunt_agent_result", "name": spec.name,
+                    "tool": ev.get("name", ""), "ok": not ev.get("is_error"),
+                    "output": ev.get("output", ""),
+                    # The command and the run metadata travel with the result so
+                    # the transcript can render a full panel rather than a
+                    # truncated one-liner. This is the operator's only view of
+                    # what the engagement is actually doing.
+                    "args": ev.get("args") or {},
+                    "meta": ev.get("meta") or {},
+                })
+                # The live edge. A report_finding call publishes here, mid-turn,
+                # rather than waiting for the wave to end — this is what makes
+                # the operator's tracker fill in as the agents work. The event
+                # above still goes out first, so the transcript shows the call
+                # before it shows what it found.
+                if run is not None and ev.get("name") == "report_finding" \
+                        and not ev.get("is_error"):
+                    live = _finding_from_tool(ev.get("meta") or {},
+                                              wave=wave, agent=spec.name)
+                    if live is not None:
+                        await _report_live(run, live, on_event)
+            elif etype == "blocked":
+                await on_event({"type": "hunt_agent_result", "name": spec.name,
+                                "tool": ev.get("name", ""), "ok": False,
+                                "output": ev.get("targets", ""),
+                                "args": {}, "meta": {}, "blocked": True})
+            elif etype == "usage":
+                result.input_tokens += ev.get("input", 0) or 0
+                result.output_tokens += ev.get("output", 0) or 0
+                result.cost += ev.get("cost", 0.0) or 0.0
+            elif etype == "error":
+                result.ok = False
+                result.error = ev.get("message", "") or "error"
+                await flush()
+        await flush()
+    except asyncio.CancelledError:
+        # Never swallow cancellation — /stop-hunt has to unwind the whole wave.
+        raise
+    except Exception as e:  # noqa: BLE001
+        result.ok = False
+        result.error = f"{type(e).__name__}: {e}"
+        await flush()
+
+    result.digest = team_mod._digest(worker, result)
+    return result
+
+
+def _chain_hooks(*hooks):
+    """Compose tool hooks into one, outermost first. ``None`` entries are skipped.
+
+    A tool hook is an async context manager factory, and two of them have to be
+    able to run around the same call: `/team`'s write lock and `/ad`'s
+    interlock. ``contextlib.AsyncExitStack`` is what makes nesting them a
+    three-line function rather than a new class — and, importantly, it unwinds
+    in reverse, so the interlock releases its throttle only after the write lock
+    has let go.
+    """
+    live = [h for h in hooks if h is not None]
+    if not live:
+        return None
+    if len(live) == 1:
+        return live[0]
+
+    @asynccontextmanager
+    async def _both(name: str, args: dict):
+        async with AsyncExitStack() as stack:
+            for h in live:
+                await stack.enter_async_context(h(name, args))
+            yield
+
+    return _both
+
+
+async def _run_wave(
+    specs: list[team_mod.WorkerSpec],
+    cfg: Config,
+    *,
+    on_event: Callable[[dict], Awaitable[None]],
+    agent_factory: Callable[..., Agent],
+    stop: asyncio.Event,
+    concurrency: int = HUNT_CONCURRENCY,
+    context: str = "",
+    contract: str = "",
+    wave: int = 0,
+    run: HuntRun | None = None,
+    interlock=None,
+) -> list[team_mod.WorkerResult]:
+    """Run one wave concurrently, racing the stop signal.
+
+    All the workers start together; ``concurrency`` is a semaphore, not a batch
+    boundary, so with the default of ten a ten-brief wave is genuinely ten
+    simultaneous streams. The wave is raced against ``stop`` rather than merely
+    checked before it: `/stop-hunt` cancels the in-flight agents instead of
+    waiting out the slowest one, which is the difference between stopping a hunt
+    and waiting for it.
+
+    ``interlock`` is the campaign kind's own tool hook, run around every call
+    alongside the write lock. It is the same object for all ten workers, which
+    is the point: `/ad`'s throttle and attempt counter have to be shared, or ten
+    parallel agents each get their own budget and the whole wave sprays ten
+    times what the operator authorised.
+    """
+    sem = asyncio.Semaphore(max(1, concurrency))
+    hook = _chain_hooks(interlock, team_mod._write_lock_hook(asyncio.Lock()))
+
+    async def _one(index: int, spec: team_mod.WorkerSpec):
+        async with sem:
+            if stop.is_set():
+                return None
+            return await _run_agent(
+                spec, index, cfg,
+                on_event=on_event, agent_factory=agent_factory, tool_hook=hook,
+                context=context, contract=contract, wave=wave, run=run,
+            )
+
+    tasks = [asyncio.create_task(_one(i, s)) for i, s in enumerate(specs)]
+    if not tasks:
+        return []
+
+    all_done = asyncio.gather(*tasks, return_exceptions=True)
+    stopper = asyncio.create_task(stop.wait())
+    try:
+        await asyncio.wait({all_done, stopper},
+                           return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        stopper.cancel()
+
+    if stop.is_set():
+        for t in tasks:
+            t.cancel()
+
+    gathered = await all_done
+    return [r for r in gathered if isinstance(r, team_mod.WorkerResult)]
+
+
+async def _collect_text(agent: Agent, prompt: str) -> str:
+    """Run one turn and return only its text, discarding the tool chatter."""
+    parts: list[str] = []
+    async for ev in agent.run_turn(prompt):
+        if ev.get("type") == "text_delta":
+            parts.append(ev.get("text", ""))
+    return "".join(parts)
+
+
+async def _stream_turn(agent: Agent, prompt: str,
+                       on_idle: Callable[[], Awaitable[None]],
+                       *, idle: float = STREAM_IDLE_SECONDS):
+    """Yield a turn's events, calling ``on_idle`` when the stream goes quiet.
+
+    A turn's prose arrives as ``text_delta`` events, and the consumers below
+    only forward it when something *else* happens — a tool call, or the end of
+    the turn. For a planner that reasons for forty seconds before its first tool
+    call, that means the screen shows nothing at all for forty seconds, which is
+    indistinguishable from a hang and is exactly the complaint the wave view was
+    built to answer.
+
+    So the wait between events is bounded: when ``idle`` seconds pass with no
+    event, ``on_idle`` runs — the consumers flush their buffer through it — and
+    the wait restarts. ``on_idle`` is a callback rather than an event yielded to
+    the caller so the generator can keep the same shape for callers that only
+    care about events.
+
+    Nothing here invents content or reorders anything: the only thing that
+    changes is *when* prose the model has already produced is handed on.
+    """
+    agen = agent.run_turn(prompt).__aiter__()
+    task: asyncio.Task | None = None
+    try:
+        while True:
+            if task is None:
+                task = asyncio.ensure_future(agen.__anext__())
+            done, _ = await asyncio.wait({task}, timeout=idle)
+            if not done:
+                await on_idle()
+                continue
+            try:
+                ev = task.result()
+            except StopAsyncIteration:
+                return
+            task = None
+            yield ev
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+        aclose = getattr(agen, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def _collect_text_live(
+    agent: Agent,
+    prompt: str,
+    on_event: Callable[[dict], Awaitable[None]],
+    run: HuntRun | None = None,
+    *,
+    prefix: str = "recon",
+) -> str:
+    """Run one turn, reporting what it is doing as it does it.
+
+    Two turns in a campaign run long enough that the operator watches them
+    directly, and a frozen line for that long is indistinguishable from a hang:
+    recon, which can take minutes against a live target, and the wave planner,
+    which is a real model call over the whole recon, every finding so far and
+    the wave history before it writes ten briefs. Both go through here, and the
+    ``prefix`` names the events they emit — ``recon`` or ``plan``. The UI routes
+    each to its own sink, so the planner's reasoning lands in the wave view
+    while recon's lands in its own window.
+
+    Only the *tool call* is reported, not its output: a tool result here is
+    arbitrary target text, and pushing it into a UI sink unescaped is how a
+    scan of a hostile page ends up painting the overlay. The model's own prose
+    is the interesting part and it is what gets shown.
+
+    ``run`` is passed so a recon agent's ``report_finding`` call publishes the
+    same way a wave agent's does. Recon is the first thing to touch the target,
+    and it is where an exposed debug endpoint or a stack trace in an error page
+    turns up — a finding confirmed here should reach the tracker now, not at the
+    first wave boundary. The planner is in plan mode and cannot report at all,
+    so it passes nothing.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+
+    async def flush() -> None:
+        text = "".join(buf).strip()
+        buf.clear()
+        if text:
+            await on_event({"type": f"hunt_{prefix}_text", "text": text})
+
+    # The watchdog, so prose reaches the screen while the model is still
+    # thinking rather than at its first tool call — see ``_stream_turn``.
+    async for ev in _stream_turn(agent, prompt, flush):
+        etype = ev.get("type")
+        if etype == "text_delta":
+            chunk = ev.get("text", "")
+            parts.append(chunk)
+            buf.append(chunk)
+        elif etype == "tool_call":
+            # Flush first, so the reasoning lands above the call it explains.
+            await flush()
+            await on_event({
+                "type": f"hunt_{prefix}_tool",
+                "tool": ev.get("name", ""),
+                "args": ev.get("args") or {},
+                "blocked": False,
+            })
+        elif etype == "tool_result":
+            if run is not None and ev.get("name") == "report_finding" \
+                    and not ev.get("is_error"):
+                live = _finding_from_tool(ev.get("meta") or {},
+                                          wave=0, agent="recon")
+                if live is not None:
+                    await _report_live(run, live, on_event)
+        elif etype == "blocked":
+            await on_event({
+                "type": f"hunt_{prefix}_tool",
+                "tool": ev.get("name", ""),
+                "args": ev.get("args") or {},
+                "blocked": True,
+            })
+        elif etype == "error":
+            await on_event({"type": f"hunt_{prefix}_text",
+                            "text": f"({prefix} error: {ev.get('message', '')})"})
+    await flush()
+    return "".join(parts)
+
+
+async def run_hunt(
+    cfg: Config,
+    target: str,
+    *,
+    on_event: Callable[[dict], Awaitable[None]],
+    agent_factory: Callable[..., Agent] = Agent,
+    stop: asyncio.Event | None = None,
+    wave_size: int = HUNT_WAVE_SIZE,
+    concurrency: int = HUNT_CONCURRENCY,
+    summary_flag: Callable[[], bool] | None = None,
+    run: HuntRun | None = None,
+    fresh: bool = False,
+    wave_number: int | None = None,
+    max_waves: int = 1,
+    kind: CampaignKind | None = None,
+) -> HuntRun:
+    """Recon, then wave(s). Returns the run for the closing report.
+
+    Every step is reported through ``on_event`` as it happens. The caller owns
+    the final summary text — this returns the run it needs to write it.
+
+    **It stops on its own now.** This used to be ``while not run.stop.is_set()``
+    with no cap at all, so a campaign ran wave after wave until the operator
+    pressed Ctrl+X — including waves planned after one that had already found a
+    critical, which is work the operator did not ask for and could not decline.
+    The loop is bounded by ``max_waves`` (default 1) and the UI never raises it,
+    so the command runs one wave per invocation and the operator decides whether
+    there is a next one. The bound is a parameter rather than a bare ``break``
+    so a test can still drive two waves through one call and check that the
+    second planner saw the first wave's findings.
+
+    ``wave_number`` names the wave to run; ``None`` means the next one the scope
+    has not run yet — see ``next_wave_number``. So ``/bug-hunt host`` continues a
+    campaign's numbering where it left off, and ``--wave 3`` runs wave 3
+    specifically, on top of whatever waves 1 and 2 already put on disk.
+
+    ``summary_flag`` is polled at each wave boundary: `/summary-hunt` cannot run
+    concurrently with the hunt (both stream through the same transcript), so it
+    sets a flag and the summary is generated here, between waves, where nothing
+    else is streaming.
+
+    ``run`` lets the caller supply the ``HuntRun`` it wants used. The UI passes
+    one it has already published, so ``/stop-hunt`` and ``/summary-hunt`` have
+    something to act on *while the campaign is running* — this function returns
+    only when the campaign is over, which is far too late to be told to stop.
+
+    ``fresh`` forces the recon phase even when the scope already has notes on
+    disk. Without it a repeat hunt reuses them and goes straight to planning —
+    see ``find_recon``. It is the operator's escape hatch for a target that has
+    actually changed since the map was drawn.
+
+    ``kind`` selects the doctrine: the prompts, the fallback vectors, the
+    campaign directory's prefix, and the tool interlock. ``None`` means
+    ``HUNT_KIND`` — `/bug-hunt` exactly as it shipped — so every existing caller
+    is unaffected. `/ad` passes its own.
+    """
+    kind = kind or HUNT_KIND
+    if run is None:
+        run = HuntRun(target=target, directory=case_dir(cfg, target, kind))
+    if stop is not None:
+        run.stop = stop
+    run.kind = kind.name
+
+    # The wave to run. `run.wave` is set to one *below* it, because the loop
+    # increments before it plans — so the counter the UI and the artefacts see
+    # is exactly the wave the operator asked for.
+    if wave_number is None:
+        wave_number = next_wave_number(run.directory)
+    run.wave = max(0, wave_number - 1)
+
+    # A wave is a step, not a label: the planner is briefed on what the previous
+    # wave found, so wave 3 on a scope that has run nothing is not wave 3, it is
+    # wave 1 with a misleading name and a planner told to follow up on findings
+    # that do not exist. Refuse it rather than run it — `next_wave_number` is
+    # what the operator wants in that case, and `--wave` is for re-running or
+    # reordering a campaign that already has a history.
+    highest = next_wave_number(run.directory) - 1
+    if wave_number > highest + 1:
+        await on_event({
+            "type": "hunt_refused", "target": run.target,
+            "wave": wave_number, "highest": highest,
+            "message": (
+                f"wave {wave_number} has nothing to follow: this scope has run "
+                f"up to wave {highest}. A wave is planned against the one before "
+                f"it, so run wave {highest + 1} first — plain "
+                f"`/{kind.command} {run.target}` does exactly that."
+            ) if highest else (
+                f"wave {wave_number} has nothing to follow: this scope has not "
+                f"run a wave yet. Start with `/{kind.command} {run.target}`."
+            ),
+        })
+        return run
+
+    # ---- recon, or the recon we already have.
+    #
+    # The campaign directory is the scope's and is reused, so a second
+    # `/bug-hunt` on the same target finds the first run's notes sitting there.
+    # Remapping a target that has not moved costs minutes of wall-clock and a
+    # wave's worth of tokens before the first brief is written, so a repeat run
+    # plans against the notes on disk instead. `fresh` is the operator's
+    # override — `/bug-hunt --fresh` — for when the target *has* moved.
+    note = None if fresh else find_recon(run.directory)
+    if note is not None:
+        run.recon = note.text
+        run.recon_source = note.path
+        run.recon_age = note.age
+    else:
+        # Runs in the session's own mode, not read-only: mapping a live target
+        # needs the shell and the network tools, and a recon phase that cannot
+        # scan is not recon. The prompt is what bounds it to reconnaissance,
+        # not the mode.
+        await on_event({"type": "hunt_recon_start", "target": target,
+                        "directory": str(run.directory)})
+        # can_report, so recon's report_finding calls publish live like a wave
+        # agent's. The final-text harvest below still runs: it catches a recon
+        # that reported in its closing JSON but never called the tool.
+        # The interlock rides on recon too. Recon is where a null session or an
+        # AS-REP roast happens, so it is exactly the phase that must not be
+        # allowed to spray — an unthrottled recon turn is the one place a
+        # campaign could lock out a domain before a single brief was written.
+        recon_agent = agent_factory(dataclasses.replace(cfg), can_report=True,
+                                    can_hunt_read=False,
+                                    tool_hook=kind.interlock)
+        run.recon = await _collect_text_live(
+            recon_agent,
+            kind.recon_prompt.format(target=target, contract=kind.contract),
+            on_event, run=run,
+        )
+        # Written before the event, so the path can ride on it: the UI has the
+        # campaign directory, but only the module knows what the file is called.
+        recon_path = write_recon(run, run.recon)
+        await on_event({"type": "hunt_recon_done", "text": run.recon,
+                        "saved": str(recon_path) if recon_path else ""})
+
+        # A recon run can itself turn up something — an exposed debug endpoint,
+        # a stack trace in an error page. Harvest it before the first wave, or
+        # the planner starts out blind to what recon already knew. Anything
+        # recon already published through the tool is deduplicated away here.
+        for f in parse_findings(run.recon, wave=0, agent="recon"):
+            await _report_live(run, f, on_event)
+
+    # ---- seed the tracker from what earlier campaigns already confirmed.
+    #
+    # Whatever happened above — reused the map, or drew a fresh one — the bugs
+    # this scope has already had are still open until someone closes them, and
+    # the planner should aim at what is left rather than re-deriving it. The
+    # seeding runs *after* recon so a bug this campaign re-confirmed is its own
+    # (the dedupe keeps the first, and recon's came first). `--fresh` seeds too:
+    # it carries no *map* — that is what fresh means — but the bugs earlier
+    # campaigns confirmed are still open, and still not this campaign's. The
+    # `carried` flag is what keeps every count honest, since the tracker is now
+    # taller than what this run actually did.
+    prior = load_run(run.directory)
+    if prior is not None:
+        for f in prior.findings:
+            f.carried = True
+            run.add_finding(f)
+    run.recon_carried = sum(1 for f in run.findings if f.carried)
+
+    # The UI is told the map was inherited — and how old it is — before the
+    # first brief is written. There is no recon window to open, so without this
+    # event the operator would see nothing at all between the banner and wave 1.
+    if note is not None:
+        await on_event({
+            "type": "hunt_recon_skipped", "target": target,
+            "path": str(note.path),
+            "age_days": note.age_days,
+            "carried": run.recon_carried,
+            # The carried findings themselves, so the tracker can open with them
+            # on the rail rather than filling in only as this campaign reports.
+            # They are already in the run, so they are not announced as new.
+            "findings": [_finding_dict(f) for f in run.ranked()],
+        })
+
+    # ---- waves. Bounded, and still racing the operator's stop: `/stop-hunt`
+    # mid-wave unwinds the agents rather than waiting out the slowest one.
+    waves_run = 0
+    while not run.stop.is_set() and waves_run < max(1, max_waves):
+        waves_run += 1
+        run.wave += 1
+        wave = run.wave
+
+        await on_event({"type": "hunt_wave_start", "wave": wave, "size": wave_size})
+
+        # Plan. Read-only, so the planner cannot start doing the work itself —
+        # the same reason team.py forces its planner to plan mode. It is handed
+        # the recon and the findings in its prompt, so it must not also read the
+        # campaign directory: that would put the raw artefacts in front of it
+        # alongside the digest, which is the same information twice.
+        planner = agent_factory(dataclasses.replace(cfg, mode="plan"),
+                                can_hunt_read=False, tool_hook=kind.interlock)
+        plan_prompt = kind.planner_prompt.format(
+            target=target,
+            wave_size=wave_size,
+            recon=run.recon or "(recon produced nothing)",
+            recon_note=(
+                RECON_INHERITED_NOTE.format(
+                    age_days=int((run.recon_age or 0) // 86400))
+                if run.reused_recon else ""
+            ),
+            findings=run.digest(),
+            waves=run.wave_digest(),
+            contract=kind.contract,
+        )
+        # Reported live, not collected silently. This turn is a real model call
+        # over the whole recon, every finding so far and the wave history — tens
+        # of seconds during which the wave view had no roster to draw and said
+        # nothing, so the operator watched a blank screen while the briefs were
+        # written. The events go out as `hunt_plan_*` and the wave view feeds
+        # them to the planning feed.
+        plan_text = await _collect_text_live(planner, plan_prompt, on_event,
+                                             prefix="plan")
+        roster = team_mod.parse_roster(plan_text, max_agents=wave_size)
+
+        # One retry before giving up on the planner. A model that answered in
+        # prose or wrapped the object in a fence it malformed usually gets it
+        # right when told plainly what was wrong, and a real roster is worth
+        # far more than the fixed matrix. Streamed too, so a retry is not a
+        # second unexplained silence.
+        if roster is None or not roster.workers:
+            retry_text = await _collect_text_live(
+                planner, plan_prompt + "\n\n" + PLANNER_RETRY_NUDGE, on_event,
+                prefix="plan")
+            if retry_text.strip():
+                plan_text = retry_text
+                roster = team_mod.parse_roster(retry_text, max_agents=wave_size)
+
+        fell_back = roster is None or not roster.workers
+        if fell_back:
+            roster = fallback_roster(wave, wave_size, kind)
+
+        # The plan lands on disk as it is announced, so a campaign's plans
+        # accumulate beside its findings instead of dying with the event stream.
+        write_plan(run, wave, roster, plan_text, fell_back)
+
+        await on_event({
+            "type": "hunt_plan", "wave": wave,
+            "summary": roster.summary,
+            "fell_back": fell_back,
+            # When the planner could not be read, hand the operator what it
+            # actually said. Silently swapping in the fixed matrix hides whether
+            # the fault is the prompt, the model, or a truncated turn — and that
+            # is not diagnosable from the outside.
+            "raw": plan_text if fell_back else "",
+            "workers": [{"name": w.name, "brief": w.brief, "owns": w.owns}
+                        for w in roster.workers],
+        })
+
+        if run.stop.is_set():
+            break
+
+        # Taken before the wave so the wave's own count can be measured as a
+        # delta: a finding reported live through report_finding is already in
+        # the tracker by the time the wave ends, so counting only the harvest
+        # below would report a wave that published a critical as "0 finding(s)".
+        before = len(run.findings)
+
+        results = await _run_wave(
+            roster.workers, cfg,
+            on_event=on_event, agent_factory=agent_factory,
+            stop=run.stop, concurrency=concurrency,
+            context=brief_context(run),
+            contract=kind.contract,
+            wave=wave, run=run,
+            interlock=kind.interlock,
+        )
+
+        # ---- harvest. Most findings already reached the tracker through
+        # report_finding while the wave was running — that is the live path, and
+        # add_finding has seen them. This sweep is the backstop for an agent
+        # that reported only in its closing JSON, and it is what keeps the
+        # planner's digest complete even when the tool was not called.
+        found: list[Finding] = []
+        for r in results:
+            for f in parse_findings(r.digest, wave=wave, agent=r.spec.name):
+                found.append(f)
+
+        for r in results:
+            await on_event({
+                "type": "hunt_agent_done", "name": r.spec.name, "wave": wave,
+                "ok": r.ok, "error": r.error, "cost": r.cost,
+                "input": r.input_tokens, "output": r.output_tokens,
+            })
+
+        # `found` is every finding reported this wave; `fresh` is the ones the
+        # tracker had not already seen. Only the fresh ones are announced, and
+        # the wave counter uses `fresh` too, so a bug three agents each
+        # rediscovered reads as one finding rather than three — and a bug an
+        # agent already published live through report_finding is not announced
+        # a second time here.
+        fresh: list[Finding] = [f for f in found if run.add_finding(f)]
+        for f in fresh:
+            await on_event({"type": "hunt_finding", "finding": _finding_dict(f),
+                            "saved": _save(run, f)})
+
+        # The wave's count is the tracker's growth, not the harvest's size: a
+        # finding that arrived live was counted the moment it was published, so
+        # the two paths have to be reconciled here or the wave reads as finding
+        # nothing. The dedupe in add_finding already guarantees no finding is
+        # counted on both paths, so the delta is exact.
+        this_wave = len(run.findings) - before
+
+        ok = sum(1 for r in results if r.ok)
+        run.waves.append(
+            f"wave {wave}: {len(roster.workers)} agents, {ok} ok, "
+            f"{this_wave} finding(s)"
+            + (" (fixed vector fallback)" if fell_back else "")
+        )
+        run.wave_records.append(WaveRecord(
+            number=wave, agents=len(roster.workers), fell_back=fell_back,
+            summary=roster.summary or "", stamp=_stamp(),
+        ))
+        await on_event({
+            "type": "hunt_wave_end", "wave": wave,
+            "agents": len(roster.workers), "ok": ok, "found": this_wave,
+            "cost": sum(r.cost for r in results),
+            "input": sum(r.input_tokens for r in results),
+            "output": sum(r.output_tokens for r in results),
+            "fell_back": fell_back,
+        })
+
+        # ---- the queued summary, run here: between waves nothing else is
+        # streaming, so it cannot corrupt the transcript.
+        if summary_flag is not None and summary_flag():
+            text = await _collect_text(agent_factory(dataclasses.replace(cfg)),
+                                       summary_prompt(run, kind))
+            path = write_summary(cfg, run, text)
+            await on_event({"type": "hunt_summary_done", "path": str(path),
+                            "text": text, "wave": wave})
+
+    # The tracker holds carried findings too, so the closing counts are split:
+    # `findings`/`saved` are what *this* campaign did, and `carried` is what it
+    # inherited. Reporting the tracker's total as the campaign's haul would
+    # claim bugs this run never found. Keyed off the flag rather than a count,
+    # so it stays right however dedupe interleaved the two.
+    own = [f for f in run.findings if not f.carried]
+    await on_event({
+        "type": "hunt_end", "wave": run.wave,
+        "findings": len(own),
+        "saved": sum(1 for f in own if f.saved),
+        "carried": len(run.findings) - len(own),
+        "directory": str(run.directory),
+        # Which command ran it, so the UI's notice to the main agent names the
+        # campaign that actually happened rather than assuming `/bug-hunt`.
+        "command": kind.command,
+    })
+    return run
+
+
+def _finding_dict(f: Finding) -> dict:
+    """A finding as a plain dict, for the UI event stream."""
+    return {
+        "wave": f.wave, "agent": f.agent, "title": f.title,
+        "severity": f.severity, "asset": f.asset, "summary": f.summary,
+        "evidence": f.evidence, "remediation": f.remediation,
+    }
+
+
+def _save(run: HuntRun, f: Finding) -> str:
+    """Write the finding's report if it is worth one. Returns the path or ''."""
+    if not f.saved:
+        return ""
+    try:
+        return str(write_report(run, f))
+    except OSError:
+        # A campaign must not die because a report file could not be written —
+        # the finding is already in the transcript and the next planner's digest.
+        return ""
+
+
+def summary_prompt(run: HuntRun, kind: "CampaignKind | None" = None) -> str:
+    """The closing brief: everything the run knows, for the final report.
+
+    ``kind`` selects the prompt template. ``None`` means ``HUNT_KIND`` — the
+    default, and what every existing caller gets — so `/bug-hunt`'s report is
+    byte-identical to what it shipped. `/ad` passes ``AD_KIND``, whose template
+    asks for the AD-specific framing: what the domain's exposure is, and which
+    attack paths were proven rather than merely indicated.
+    """
+    kind = kind or HUNT_KIND
+    if run.findings:
+        blocks = []
+        for f in run.ranked():
+            blocks.append(
+                f"### [{f.severity}] {f.title}\n"
+                f"asset: {f.asset or '(not stated)'}\n"
+                f"found by: {f.agent} (wave {f.wave})\n\n"
+                f"{f.summary or '(no summary)'}\n\n"
+                f"evidence: {f.evidence or '(none recorded)'}\n\n"
+                f"suggested fix: {f.remediation or '(none)'}"
+            )
+        findings = "\n\n".join(blocks)
+    else:
+        findings = "(no findings were confirmed)"
+
+    return kind.summary_prompt.format(
+        target=run.target,
+        waves=run.wave_digest(),
+        recon=run.recon or "(recon produced nothing)",
+        findings=findings,
+    )
+
+
+@dataclass
+class ReconNote:
+    """Recon already on disk for a scope, as a repeat hunt finds it.
+
+    ``text`` is the recon body with its frontmatter and heading stripped, ready
+    to hand straight to a planner or a summary — the same reduction ``load_run``
+    makes. ``age`` is seconds since the file was written, which is what the UI
+    quotes so the operator can judge whether the map is still worth trusting.
+    """
+
+    text: str
+    path: Path
+    age: float
+
+    @property
+    def age_days(self) -> int:
+        """Whole days since the recon was written, for the operator's notice."""
+        return int(self.age // 86400)
+
+
+def _recon_body(text: str) -> str:
+    """Strip a recon file's frontmatter and heading, leaving the notes.
+
+    Shared by ``find_recon`` and ``load_run`` so a reused recon and a recovered
+    summary read back identically — they are the same file read for two reasons,
+    and a second parser would drift from the first.
+    """
+    body = text.split("\n---", 2)[-1] if text.startswith("---") else text
+    body = body.strip()
+    # A heading with nothing under it is not a map — strip the heading and the
+    # empty body is the answer. The ``in`` guard matters: splitting a lone
+    # "# Recon" on its newline would hand back the heading itself, and a
+    # caller would take it for content.
+    if body.startswith("# ") and "\n" in body:
+        body = body.split("\n", 1)[1]
+    elif body.startswith("# "):
+        body = ""
+    return body.strip()
+
+
+def find_recon(directory: Path) -> ReconNote | None:
+    """The newest recon already recorded for a scope, or None.
+
+    This is what makes a repeat `/bug-hunt` skip the recon phase: the campaign
+    directory is the scope's and is reused, so a second run finds the first
+    run's notes sitting there and can plan a wave against them instead of
+    spending minutes remapping a target that has not moved.
+
+    Newest by filename, not mtime — ``recon-<stamp>.md`` sorts by the timestamp
+    it carries, and the same convention already orders a campaign's artefacts.
+    Returns None when the directory holds no recon, or holds only an empty one;
+    an empty recon is not something to plan against, and re-running is the
+    honest answer.
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        return None
+    for path in sorted(directory.glob("recon-*.md"), reverse=True):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        body = _recon_body(text)
+        if not body:
+            continue
+        try:
+            age = max(0.0, time.time() - path.stat().st_mtime)
+        except OSError:
+            age = 0.0
+        return ReconNote(text=body, path=path, age=age)
+    return None
+
+
+def load_run(directory: Path) -> HuntRun | None:
+    """Rebuild a run from an archived campaign directory.
+
+    Used by `/summary-hunt` when no hunt is live: the findings are re-read from
+    the report files rather than kept in memory, so a summary can be asked for
+    after a restart, or for a campaign that ran in an earlier session. Returns
+    None when the directory holds nothing to summarise.
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        return None
+
+    findings: list[Finding] = []
+    for path in _finding_files(directory):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        meta = _read_frontmatter(text)
+        findings.append(Finding(
+            wave=_as_int(meta.get("wave")),
+            agent=meta.get("agent", "?"),
+            title=_first_heading(text) or path.stem,
+            severity=normalise_severity(meta.get("severity", "info")),
+            asset=meta.get("asset", ""),
+            summary=_section(text, "Summary"),
+            evidence=_section(text, "Evidence"),
+            remediation=_section(text, "Remediation"),
+        ))
+
+    # Recon comes back too, from the newest notes file. Without this a summary
+    # asked for after a restart quoted "recon produced nothing" over a recon
+    # that had mapped the whole target — the recon is usually the most
+    # informative part of the run, and it is now on disk to be read back.
+    recon = ""
+    note = find_recon(directory)
+    if note is not None:
+        recon = note.text
+
+    # The plans are read back as the wave history, so a recovered summary can
+    # say what each wave was aimed at rather than only what it found. Both
+    # layouts are read — see `_plan_files` — so a campaign the boot migration
+    # has not reached yet still recovers its history.
+    #
+    # One record per *wave*, not per plan. A wave that was deliberately re-run
+    # leaves every plan on disk — that is the operator's record, and `_unique`
+    # is what keeps them — but a wave is one thing, and counting plans made a
+    # report claim "16 waves" over an 11-wave campaign whose wave 1 had been run
+    # three times. The latest run of a wave wins.
+    #
+    # "Latest" is the pair of the frontmatter timestamp and the write order,
+    # because neither alone is enough. Two runs inside the same second share a
+    # timestamp; and the filename cannot break that tie, since `_unique` names
+    # the *second* plan `plan-2.md`, which sorts *before* `plan.md` — filename
+    # order picks the oldest. `_plan_seq` reads that counter back out, so the
+    # pair is a total order that matches the order the plans were written in.
+    best: dict[int, tuple[tuple[str, int], WaveRecord]] = {}
+    #: The doctrine, taken from the newest plan that names one. Defaulted below
+    #: to "hunt" so every campaign written before the field existed — which is
+    #: every campaign on disk today — reads back as the web hunt it was.
+    kind = ""
+    kind_order: tuple[str, int] = ("", 0)
+    for path in _plan_files(directory):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        meta = _read_frontmatter(text)
+        record = WaveRecord(
+            number=_as_int(meta.get("wave"), 0),
+            agents=_as_int(meta.get("agents"), 0),
+            fell_back=meta.get("fell_back", "false").strip().lower() == "true",
+            # The first prose paragraph, which is where write_plan puts the
+            # planner's summary of what the wave is for. The heading line above
+            # it is the wave's agent count, which `agents` already carries.
+            summary=_plan_summary(text),
+            stamp=meta.get("timestamp", ""),
+        )
+        order = (record.stamp, _plan_seq(path))
+        seen = best.get(record.number)
+        if seen is None or order >= seen[0]:
+            best[record.number] = (order, record)
+        if meta.get("kind", "").strip() and order >= kind_order:
+            kind, kind_order = meta["kind"].strip(), order
+    records = [best[n][1] for n in sorted(best)]
+
+    # How many findings each wave actually produced, so a recovered digest can
+    # say what a wave found as well as what it aimed at. Counted off the
+    # findings, not the plan: a plan records intent, and the finding is the
+    # only evidence that the intent was met.
+    per_wave: dict[int, int] = {}
+    for f in findings:
+        per_wave[f.wave] = per_wave.get(f.wave, 0) + 1
+
+    waves = [f"(recovered from {directory})"]
+    waves += [r.line(per_wave.get(r.number, 0)) for r in records]
+
+    # A wave that ran and found nothing still leaves a plan, and that is now a
+    # state the operator reaches routinely: one wave per invocation means an
+    # empty wave is the *expected* way to end a campaign. Refusing to load it
+    # would make `/summary-hunt` say "no campaign here" over a directory whose
+    # tree plainly shows ten agents went out — so a plan counts as content.
+    if not findings and not recon and not records:
+        return None
+
+    return HuntRun(
+        target=directory.name,
+        directory=directory,
+        recon=recon,
+        findings=findings,
+        waves=waves,
+        wave_records=records,
+        kind=kind or "hunt",
+        # So `--wave` on a recovered campaign continues its numbering rather
+        # than restarting at 1 and overwriting what is on disk. The highest wave
+        # anything on disk names, plan or finding.
+        wave=max([f.wave for f in findings] + [r.number for r in records] + [0]),
+    )
+
+
+def _plan_seq(path: Path) -> int:
+    """The write order of a plan, read back out of its ``_unique`` suffix.
+
+    ``plan.md`` is the first run of a wave and scores 1; ``plan-2.md`` is the
+    second and scores 2. ``load_run`` uses this only as a tiebreak, for plans
+    written inside the same second — but it is the *right* tiebreak, because
+    the number was assigned in the order the files were created, and it is the
+    one piece of ordering `_unique` records. A name it did not produce scores 0,
+    so a hand-made file never displaces a real run.
+    """
+    m = re.search(r"-(\d+)$", path.stem)
+    return int(m.group(1)) if m else 1
+
+
+def _plan_summary(text: str) -> str:
+    """The planner's own summary of a wave, out of a plan file.
+
+    ``write_plan`` writes the heading, then the roster's summary as a plain
+    paragraph, then ``## Roster``. This takes everything between them, so the
+    summary reads back whole even when it is several lines.
+    """
+    after = text.split("\n# ", 1)
+    if len(after) < 2:
+        return ""
+    body = after[1]
+    body = body.split("\n", 1)[1] if "\n" in body else ""
+    body = body.split("\n## ", 1)[0]
+    return body.strip()
+
+
+def _as_int(value, default: int = 0) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _read_frontmatter(text: str) -> dict[str, str]:
+    """The YAML frontmatter of a report file, as flat strings.
+
+    Hand-rolled rather than pulling in a YAML dependency: the frontmatter this
+    module writes is a flat map of scalars, and that is all it needs to read.
+    """
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in text[3:end].splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _first_heading(text: str) -> str:
+    for line in text.splitlines():
+        if line.startswith("# "):
+            return line[2:].strip()
+    return ""
+
+
+def _section(text: str, name: str) -> str:
+    """The body under ``## <name>``, up to the next heading."""
+    marker = f"## {name}"
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    start = text.find("\n", start)
+    if start < 0:
+        return ""
+    rest = text[start + 1 :]
+    end = rest.find("\n## ")
+    body = rest if end < 0 else rest[:end]
+    return body.strip()

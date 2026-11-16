@@ -1,0 +1,600 @@
+#!/usr/bin/env bash
+# lanthorn — launcher.
+#
+# Starts the harness. The default route is Logfare over Chat Completions at
+# https://logfare.ai/v1 — direct, with no local LiteLLM proxy. A proxy is only
+# managed when explicitly asked for (LANTHORN_NO_PROXY=0), for a route that
+# still uses one. Every argument is forwarded verbatim to `python -m lanthorn`,
+# so `lanthorn --help`, `lanthorn -C ~/proj` etc. all work unchanged.
+#
+# Configure through environment variables only:
+#
+#   LANTHORN_HOME              harness dotdir            (default ~/.lanthorn)
+#   LITELLM_ENV_FILE      profile to source         (default $LANTHORN_HOME/logfare/source)
+#   LITELLM_PORT          proxy port                (default 4001)
+#   LITELLM_SERVICE       proxy manager             (default $LANTHORN_HOME/logfare/start-litellm.sh)
+#   LANTHORN_NO_PROXY=1        never touch a proxy (the default)
+#   LANTHORN_NO_PROXY=0        manage a local proxy for a route that needs one
+#   LANTHORN_WITH_PROXY=1      same as LANTHORN_NO_PROXY=0 (explicit opt-in)
+#   LANTHORN_REQUIRE_PROXY=1   hard-fail if a proxy is not healthy
+#
+# No key is ever printed or logged.
+
+set -euo pipefail
+
+# Windows has no shebang: CreateProcess cannot start a text file, so a script
+# named on a command line -- install.sh, setup.sh, this launcher -- is run by
+# whatever bash Windows associates with .sh. The MSYS one, when it is what
+# spawned us, does not pass the environment through the way a native process
+# does (HOME becomes /root, LANTHORN_ROOT and PYTHONPATH are lost), so a
+# re-executed script would run against the wrong environment or fail outright.
+# Re-exec under the Git Bash on PATH, once, and the script runs in the shell
+# the operator actually invoked it from.
+if [[ "${OSTYPE:-}" == msys* || "${OSTYPE:-}" == cygwin* ]]; then
+  if [[ -z "${LANTHORN_REEXEC:-}" ]] && command -v cygpath >/dev/null 2>&1; then
+    _self_bash="$(command -v bash || true)"
+    _self_src="${BASH_SOURCE[0]:-}"
+    if [[ -n "$_self_bash" && -n "$_self_src" && -f "$_self_src" ]]; then
+      case "$_self_bash" in
+        /usr/bin/*|/bin/*)
+          export LANTHORN_REEXEC=1
+          _self_win="$(cygpath -w "$_self_src")"
+          exec "$_self_bash" "$_self_win" "$@"
+          ;;
+      esac
+    fi
+  fi
+fi
+
+# Find the checkout. This launcher lives in <root>/packaging/, so when
+# LANTHORN_ROOT is not already exported — run.sh and the installed shim both
+# export it — the checkout is the parent of this file's directory. Symlinks are
+# resolved by the helper above, so the same rule holds however it was reached.
+# Resolve this script's directory without `readlink -f`: GNU's -f is not on
+# macOS (BSD readlink has no -f), so symlinks are followed by hand.
+_self_path="${BASH_SOURCE[0]}"
+while [[ -L "$_self_path" ]]; do
+  _self_link_dir="$(cd -- "$(dirname "$_self_path")" && pwd -P)"
+  _self_path="$(readlink "$_self_path")"
+  [[ "$_self_path" == /* ]] || _self_path="$_self_link_dir/$_self_path"
+done
+_self_dir="$(cd -- "$(dirname "$_self_path")" && pwd -P)"
+if [[ -z "${LANTHORN_ROOT:-}" ]]; then
+  if [[ "$(basename "$_self_dir")" == "packaging" ]]; then
+    LANTHORN_ROOT="$(dirname "$_self_dir")"
+  else
+    LANTHORN_ROOT="$_self_dir"
+  fi
+fi
+
+# A root that carries no package is not a checkout -- a half-finished clone, or
+# a launcher copied somewhere on its own. Say so here: the interpreter's own
+# "No module named lanthorn" names the interpreter, which sends the reader
+# looking in the wrong place.
+if [[ ! -f "$LANTHORN_ROOT/lanthorn/__init__.py" ]]; then
+  echo "lanthorn: $LANTHORN_ROOT is not a Lanthorn checkout (no lanthorn/__init__.py)" >&2
+  echo "          set LANTHORN_ROOT to the clone, or re-run the installer." >&2
+  exit 2
+fi
+
+# Resolve the interpreter that carries Lanthorn's dependencies.
+#
+# Prefer the checkout's own venv — the one install.sh builds — so a global
+# install runs with no activation at all. That is what lets `lanthorn` work
+# from any directory without the operator touching a shell. Failing that, fall
+# back to an activated venv ($VIRTUAL_ENV), then a python3 on PATH, which is
+# the bring-your-own-venv layout. This script never creates a venv.
+# A Windows venv (python -m venv under Git Bash) keeps its interpreter in
+# Scripts/, not bin/ — resolve the one that is there before giving up on it.
+if [[ -x "$LANTHORN_ROOT/.venv/bin/python" ]]; then
+  VENV_PY="$LANTHORN_ROOT/.venv/bin/python"
+elif [[ -x "$LANTHORN_ROOT/.venv/Scripts/python.exe" ]]; then
+  VENV_PY="$LANTHORN_ROOT/.venv/Scripts/python.exe"
+else
+  VENV_PY=""
+fi
+if [[ -n "$VENV_PY" ]]; then
+  PY="$VENV_PY"
+elif [[ -n "${VIRTUAL_ENV:-}" && -x "$VIRTUAL_ENV/bin/python" ]]; then
+  PY="$VIRTUAL_ENV/bin/python"
+else
+  # python3, then python: on Windows (Git Bash) `python3` is often the
+  # Microsoft Store alias, which exists but runs nothing, while the real
+  # interpreter is plain `python`. A stub that fails is worse than no file at
+  # all, so the first candidate that actually runs wins.
+  PY=""
+  for _cand in "$(command -v python3 || true)" "$(command -v python || true)"; do
+    if [[ -n "$_cand" ]] && "$_cand" -c 'import sys' >/dev/null 2>&1; then
+      PY="$_cand"; break
+    fi
+  done
+fi
+
+LANTHORN_HOME="${LANTHORN_HOME:-$HOME/.lanthorn}"
+
+# Direct is the default. The harness speaks Chat Completions itself, so the
+# bundled Logfare proxy is not part of the route and starting it would only add
+# a hop (and a "starting LiteLLM proxy" message) to a session that never uses
+# it. A proxy is managed only when explicitly asked for: LANTHORN_NO_PROXY=0,
+# or LANTHORN_REQUIRE_PROXY=1 for a route that genuinely needs one.
+if [[ "${LANTHORN_WITH_PROXY:-0}" == "1" \
+      || "${LANTHORN_REQUIRE_PROXY:-0}" == "1" ]]; then
+  LANTHORN_NO_PROXY="${LANTHORN_NO_PROXY:-0}"
+else
+  LANTHORN_NO_PROXY="${LANTHORN_NO_PROXY:-1}"
+fi
+
+# Which upstream to use. An explicit environment variable always wins; failing
+# that, honour the source last chosen with /source-logfare or /source-tokenjuice, so
+# restarting lands back on whichever one was working. Absent either, Logfare.
+_env_override="${LITELLM_ENV_FILE:-}"
+_port_override="${LITELLM_PORT:-}"
+_svc_override="${LITELLM_SERVICE:-}"
+
+_current_source=""
+if [[ -r "$LANTHORN_HOME/current-source" ]]; then
+  _current_source="$(tr -d '[:space:]' < "$LANTHORN_HOME/current-source" 2>/dev/null || true)"
+fi
+
+# A parked source is not a selection. Nothing is parked right now — the
+# authority for that is UNDER_CONSTRUCTION in lanthorn/sources.py, and any check
+# is repeated here only because this script reads current-source itself and
+# cannot import Python. Without it, a selection file left over from before a
+# park would start that proxy and point the session at it, which is the one
+# thing parking it is meant to prevent.
+#
+# Logfare is NOT parked: `/source-logfare` is a real switch, and a remembered
+# selection of it is honoured like any other. It also happens to be the default
+# route, so a cleared selection still lands there — the difference is that an
+# explicit one now survives a restart.
+
+# An endpoint already in the environment wins over everything below.
+#
+# `source ~/claude-source/haiku-5.5 && lanthorn` is how the operator points a
+# session at a hosted provider, and it has to mean the same thing here as it
+# does for Claude Code. The launcher would otherwise source $LITELLM_ENV_FILE,
+# whose own ANTHROPIC_BASE_URL would clobber the inherited one — leaving a
+# session on the wrong provider with no indication, which is exactly what the
+# fail-closed check further down exists to prevent. A *local* inherited URL is
+# left on the normal path: that is the ordinary proxy case and still needs the
+# profile and the health check.
+_inherited_base_url="${ANTHROPIC_BASE_URL:-}"
+_skip_profile=0
+if [[ -n "$_inherited_base_url" \
+      && "$_inherited_base_url" != *"localhost:"* \
+      && "$_inherited_base_url" != *"127.0.0.1:"* ]]; then
+  _skip_profile=1
+  LANTHORN_NO_PROXY=1
+fi
+
+if [[ "$_skip_profile" != "1" ]]; then
+  # The hosted gateways — TokenHarbour, OpenRouter — are remote: there
+  # is no proxy to start, and no LiteLLM config to point at one. Lanthorn's own
+  # profile (written by /<name>-api-setup) is sourced when it exists, which sets
+  # ANTHROPIC_BASE_URL to the hosted endpoint; the case below then skips the
+  # proxy on its own. When it does not exist the key lives in the environment or
+  # in ~/claude-source, and the harness resolves it from there — so nothing is
+  # sourced and nothing is required, but the fail-closed check must still be told
+  # there is no proxy to insist on.
+  #
+  # Every hosted gateway needs this branch, not just the first one written.
+  # Without it a remembered TokenHarbour or OpenRouter selection falls through
+  # to the Logfare profile below: the launcher then tries to start LiteLLM for a
+  # session
+  # that will never use it, and on a machine with no Logfare profile installed it
+  # dies fail-closed — "profile not found" — for a gateway that needs no profile
+  # at all. That is a session that cannot start, for a reason that is not true.
+  case "$_current_source" in
+    tokenharbour|openrouter|moonmath)
+      if [[ -r "$LANTHORN_HOME/$_current_source/source" ]]; then
+        LITELLM_ENV_FILE="${_env_override:-$LANTHORN_HOME/$_current_source/source}"
+      fi
+      LANTHORN_NO_PROXY=1
+      ;;
+  esac
+fi
+
+if [[ "$_current_source" == "iteracompute" ]]; then
+  # A local proxy, like Logfare — but the profile is the operator's own key, so
+  # there is nothing shipped to fall back to. When it is missing, fall through
+  # to Logfare rather than dying fail-closed on a route the operator has not
+  # finished setting up: `/iteracompute-api-setup` is the command that fixes it,
+  # and a session that cannot start cannot run it.
+  _ic_profile="$LANTHORN_HOME/iteracompute/source"
+  _ic_service="$LANTHORN_HOME/iteracompute/start-litellm.sh"
+  if [[ -r "$_ic_profile" && -x "$_ic_service" ]]; then
+    LITELLM_ENV_FILE="${_env_override:-$_ic_profile}"
+    LITELLM_PORT="${_port_override:-4002}"
+    LITELLM_SERVICE="${_svc_override:-$_ic_service}"
+    LITELLM_LOG="${LITELLM_LOG:-/tmp/litellm-itera.log}"
+  fi
+fi
+
+if [[ "$_current_source" == "infronai" ]]; then
+  # The same fail-open arrangement as IteraCompute: a local proxy whose profile
+  # is the operator's own, so there is nothing shipped to fall back to. When it
+  # is missing, fall through to Logfare rather than dying fail-closed on a route
+  # that has not been set up — `/infronai-api-setup` is the command that fixes
+  # it, and a session that cannot start cannot run it.
+  _inf_profile="$LANTHORN_HOME/infronai/source"
+  _inf_service="$LANTHORN_HOME/infronai/start-litellm.sh"
+  if [[ -r "$_inf_profile" && -x "$_inf_service" ]]; then
+    LITELLM_ENV_FILE="${_env_override:-$_inf_profile}"
+    LITELLM_PORT="${_port_override:-4003}"
+    LITELLM_SERVICE="${_svc_override:-$_inf_service}"
+    LITELLM_LOG="${LITELLM_LOG:-/tmp/litellm-infron.log}"
+  fi
+fi
+
+if [[ "$_current_source" == "tokenjuice" ]]; then
+  # Direct route: no proxy, no port, nothing to start. The profile is the whole
+  # install — it carries the key and the upstream URL, so sourcing it below is
+  # enough, and the "not the local proxy" check that follows turns the proxy
+  # handling off by itself. Prefer the installed profile; fall back to the
+  # standalone deepseek-claude layout for a machine that had one before
+  # Lanthorn was installed.
+  _tj_profile="$LANTHORN_HOME/tokenjuice/source"
+  [[ -r "$_tj_profile" ]] || _tj_profile="$HOME/claude-source/deepseek-claude"
+  # The shared profile ships in the tree, so a fresh clone has a working route
+  # with no signup. A personal profile or the older home layout always wins.
+  [[ -r "$_tj_profile" ]] || _tj_profile="$LANTHORN_ROOT/packaging/tokenjuice/source"
+  # Only switch if a profile is actually there; otherwise fall through to
+  # Logfare rather than dying fail-closed on a route that has no key.
+  if [[ -r "$_tj_profile" ]]; then
+    LITELLM_ENV_FILE="${_env_override:-$_tj_profile}"
+    LANTHORN_NO_PROXY=1
+  fi
+fi
+
+if [[ "$_current_source" == "nvidia" ]]; then
+  # Direct route on the same terms as Token Juice, with one difference that
+  # matters: nothing ships. The key is the operator's own developer key, written
+  # by /nvidia-api-setup, so there is no fallback profile to reach for — and
+  # when the profile is missing this falls through to Logfare rather than dying
+  # fail-closed on a route that was never finished setting up. Without this
+  # branch at all, a remembered NVIDIA selection would take the Logfare path,
+  # start LiteLLM for a session that will never use it, and on a machine with no
+  # Logfare profile die with "profile not found" for a reason that is not true.
+  _nv_profile="$LANTHORN_HOME/nvidia/source"
+  if [[ -r "$_nv_profile" ]]; then
+    LITELLM_ENV_FILE="${_env_override:-$_nv_profile}"
+    LANTHORN_NO_PROXY=1
+  fi
+fi
+
+if [[ "$_current_source" == "inferx" ]]; then
+  # Direct route on the same terms as NVIDIA, and load-bearing for the same
+  # reason: without this branch a remembered InferX selection falls through to
+  # the Logfare profile below, so the launcher would source the wrong endpoint
+  # and the session would silently start on Logfare. Nothing ships for it — the
+  # key is the operator's own, written by /inferx-api-setup — so the branch is
+  # guarded on the profile being readable and falls through rather than dying
+  # fail-closed on a route that was never finished setting up.
+  _ix_profile="$LANTHORN_HOME/inferx/source"
+  if [[ -r "$_ix_profile" ]]; then
+    LITELLM_ENV_FILE="${_env_override:-$_ix_profile}"
+    LANTHORN_NO_PROXY=1
+  fi
+fi
+
+if [[ "$_current_source" == "inferbase" ]]; then
+  # Direct route on the same terms as NVIDIA and InferX, and load-bearing for
+  # the same reason: without this branch a remembered Inferbase selection falls
+  # through to the Logfare profile below, so the launcher would source the wrong
+  # endpoint and the session would silently start on Logfare. Nothing ships for
+  # it — the key is the operator's own, written by /inferbase-api-setup — so the
+  # branch is guarded on the profile being readable and falls through rather
+  # than dying fail-closed on a route that was never finished setting up.
+  _ib_profile="$LANTHORN_HOME/inferbase/source"
+  if [[ -r "$_ib_profile" ]]; then
+    LITELLM_ENV_FILE="${_env_override:-$_ib_profile}"
+    LANTHORN_NO_PROXY=1
+  fi
+fi
+
+if [[ "$_current_source" == "flex" ]]; then
+  # The one source whose profile is not a credential: the Flex playground
+  # authenticates nothing, so this file records the route and the model. It
+  # ships in the tree, which is what makes /source-flex work on a fresh clone —
+  # and the operator's own copy wins, so a model pinned with /model survives a
+  # reinstall. Load-bearing for the same reason as the branches above: without
+  # it a remembered Flex selection falls through to the Logfare profile and the
+  # session comes up on the wrong provider with no indication.
+  _fx_profile="$LANTHORN_HOME/flex/source"
+  [[ -r "$_fx_profile" ]] || _fx_profile="$LANTHORN_ROOT/packaging/flex/source"
+  if [[ -r "$_fx_profile" ]]; then
+    LITELLM_ENV_FILE="${_env_override:-$_fx_profile}"
+    LANTHORN_NO_PROXY=1
+  fi
+fi
+
+LITELLM_ENV_FILE="${LITELLM_ENV_FILE:-$LANTHORN_HOME/logfare/source}"
+LITELLM_PORT="${LITELLM_PORT:-4001}"
+LITELLM_LOG="${LITELLM_LOG:-/tmp/litellm-lanthorn.log}"
+LITELLM_SERVICE="${LITELLM_SERVICE:-$LANTHORN_HOME/logfare/start-litellm.sh}"
+
+LANTHORN_REQUIRE_PROXY="${LANTHORN_REQUIRE_PROXY:-0}"
+
+# Diagnostics go to stderr so piped/redirected runs stay parseable.
+die()  { printf '\033[31m[lanthorn]\033[0m %s\n' "$*" >&2; exit 2; }
+warn() { printf '\033[33m[lanthorn]\033[0m %s\n' "$*" >&2; }
+info() { printf '\033[36m[lanthorn]\033[0m %s\n' "$*" >&2; }
+
+# Keep the checkout's own venv in step with requirements.txt.
+#
+# install.sh builds $LANTHORN_ROOT/.venv once. requirements.txt can still move
+# under it — a launch-time update pulls a new one, or the operator edits it —
+# and a stale venv then fails the dependency check below on a missing import.
+# So reinstall only when the file's content differs from what was last
+# installed, recorded in a stamp inside the venv: an ordinary launch pays
+# nothing but a hash. Only a venv Lanthorn owns is touched — a bring-your-own
+# venv is left exactly as the operator set it up.
+sync_deps() {
+  local req="$LANTHORN_ROOT/requirements.txt" stamp="$LANTHORN_ROOT/.venv/.requirements.sha"
+  [[ -n "${VENV_PY:-}" && "$PY" == "$VENV_PY" && -f "$req" ]] || return 0
+
+  local want=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    want="$(sha256sum "$req" | cut -d' ' -f1)"
+  elif command -v shasum >/dev/null 2>&1; then
+    want="$(shasum -a 256 "$req" | cut -d' ' -f1)"
+  else
+    return 0   # no hasher: leave the venv alone rather than reinstall every launch
+  fi
+  [[ -r "$stamp" && "$(cat "$stamp" 2>/dev/null)" == "$want" ]] && return 0
+
+  info "dependencies changed — refreshing the venv (one-off)..."
+  # pip resolves a bare `-e .` against the CURRENT directory, not against the
+  # requirements file it appears in — so this must run from the checkout, or
+  # the trailing `-e .` in requirements.txt installs whatever project the
+  # operator happened to be standing in. Subshell, so the launch's own cwd is
+  # left alone.
+  if ( cd "$LANTHORN_ROOT" && \
+       "$PY" -m pip install --quiet --disable-pip-version-check -r "$req" </dev/null ); then
+    printf '%s' "$want" > "$stamp"
+    info "venv up to date."
+  else
+    warn "could not refresh the venv — run $LANTHORN_ROOT/install.sh"
+  fi
+}
+
+# --- preconditions -----------------------------------------------------------
+
+[[ -n "$PY" ]] || die "no python3 on PATH.
+       Create a venv, activate it, then install the dependencies:
+           python3 -m venv .venv && source .venv/bin/activate
+           pip install -r requirements.txt"
+
+# The dependencies must be importable by THIS interpreter. Checking here turns
+# a confusing ImportError at launch into the one command that fixes it.
+#
+# This runs before the profile and the proxy are touched, and it is the one
+# place the ordering matters: a session that cannot import its own libraries
+# must not first start a proxy or rewrite a credential file.
+#
+# cwd and stdin are both detached. cwd, so a stray checkout on sys.path cannot
+# satisfy the import (lanthorn itself is made importable by the PYTHONPATH
+# export below; only third-party packages are checked). stdin, because a bare
+# interpreter under Git Bash can start in "bash mode" and read its commands
+# from the terminal instead of running the -c string. /tmp rather than /,
+# because the MSYS root has no site-packages.
+if ! ( cd "${TMPDIR:-/tmp}" && "$PY" -c 'import anthropic, textual, rich, yaml' </dev/null ) >/dev/null 2>&1; then
+  die "Lanthorn's dependencies are not installed for $PY
+       Create a venv, activate it, then install them:
+           python3 -m venv .venv && source .venv/bin/activate
+           pip install -r requirements.txt"
+fi
+
+# Bring the bundled venv up to date first, so the import check above tested the
+# interpreter as it was before this launch, and a refresh changes the answer.
+
+# interpreter as it will actually be after this launch, not as it was.
+sync_deps
+
+# The dependencies must be importable by THIS interpreter. Checking here turns
+# a confusing ImportError at launch into the one command that fixes it. Run
+# from / so a stray checkout on sys.path cannot satisfy the import; lanthorn
+# itself is made importable by the PYTHONPATH export below, so only the
+# third-party packages are checked.
+#
+# /tmp rather than /: the MSYS root has no site-packages, and `/` is a valid
+# directory for every interpreter on every host, so the check means the same
+# thing under Git Bash, Linux and macOS.
+# stdin is /dev/null for the same reason as the cwd: under Git Bash a bare
+# interpreter handed a terminal starts in "bash mode" and reads its commands
+# from stdin instead of running the -c string, so the check would fail for a
+# python that has every dependency.
+# Fail CLOSED only when a proxy was explicitly requested. In the default direct
+# mode there is no profile to insist on: the harness starts on Logfare's direct
+# endpoint and the operator can set a key from inside the TUI.
+if [[ "$LANTHORN_NO_PROXY" != "1" && ! -r "$LITELLM_ENV_FILE" ]]; then
+  die "profile not found: $LITELLM_ENV_FILE
+       Refusing to run a proxied session without it: the harness would use
+       whatever ANTHROPIC_* variables your shell already exports.
+       Fix:  run ./setup.sh, or LANTHORN_NO_PROXY=1 lanthorn ... for a direct endpoint."
+fi
+
+# --- load the profile --------------------------------------------------------
+
+_prev_base_url="${ANTHROPIC_BASE_URL:-}"
+_sourced_profile=""
+if [[ "$_skip_profile" != "1" && -r "$LITELLM_ENV_FILE" ]]; then
+  _sourced_profile="$LITELLM_ENV_FILE"
+  set -a
+  # shellcheck disable=SC1090
+  . "$LITELLM_ENV_FILE"
+  set +a
+  if [[ -n "$_prev_base_url" && "$_prev_base_url" != "${ANTHROPIC_BASE_URL:-}" ]]; then
+    warn "overriding inherited ANTHROPIC_BASE_URL=$_prev_base_url -> ${ANTHROPIC_BASE_URL:-}"
+  fi
+fi
+
+# No profile, no inherited endpoint: start on the built-in direct route. This
+# is the fresh-install-with-LANTHORN_SKIP_SETUP case, and the TUI is where the
+# key gets set, so refusing to launch would be the one thing that makes it
+# unfixable from inside the harness.
+if [[ -z "${ANTHROPIC_BASE_URL:-}" && -z "${OPENAI_BASE_URL:-}" ]]; then
+  export ANTHROPIC_BASE_URL="https://logfare.ai/v1"
+  export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-deepseek-v4.1-flash-1017}"
+fi
+
+# --- an older profile still names the retired Logfare proxy ------------------
+#
+# Logfare went direct: setup.sh no longer installs the :4001 proxy and the
+# launcher no longer starts it unless asked. A profile written by an older
+# install still says http://localhost:4001, and nothing answers there any more,
+# so a session that was updated by the launch-time self-update (which does not
+# run setup.sh) would come up on a dead endpoint and every turn would fail.
+#
+# Move the session onto the direct route and rewrite the profile, so the next
+# launch does not repeat this. A profile that was *not* the Logfare one — or an
+# operator who explicitly asked for the proxy with LANTHORN_NO_PROXY=0 — is
+# left exactly as it is.
+if [[ "$LANTHORN_NO_PROXY" == "1" && -n "$_sourced_profile" ]] \
+   && grep -qE "^export ANTHROPIC_BASE_URL=.*(localhost|127\.0\.0\.1):${LITELLM_PORT}" \
+        "$_sourced_profile" 2>/dev/null; then
+  export ANTHROPIC_BASE_URL="https://logfare.ai/v1"
+  info "the profile names the retired Logfare proxy — using $ANTHROPIC_BASE_URL"
+  _migrate_tmp="$(mktemp "${TMPDIR:-/tmp}/lanthorn-profile.XXXXXX")"
+  if sed -E \
+       "s|^export ANTHROPIC_BASE_URL=.*|export ANTHROPIC_BASE_URL=\"$ANTHROPIC_BASE_URL\"|" \
+       "$_sourced_profile" > "$_migrate_tmp" 2>/dev/null; then
+    if ! cmp -s "$_sourced_profile" "$_migrate_tmp"; then
+      cp -p "$_sourced_profile" "$_sourced_profile.bak" 2>/dev/null || true
+      cat "$_migrate_tmp" > "$_sourced_profile" 2>/dev/null || true
+      chmod 600 "$_sourced_profile" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$_migrate_tmp"
+fi
+
+# --- only manage a proxy when the profile points at the local one ------------
+
+case "${ANTHROPIC_BASE_URL:-}" in
+  *"localhost:${LITELLM_PORT}"*|*"127.0.0.1:${LITELLM_PORT}"*) ;;
+  *)
+    # A route that already knows it has no proxy — a hosted gateway, or Token
+    # Juice's direct endpoint — is not a mistake worth a warning. One that was
+    # expected to be local and is not still is.
+    if [[ "$LANTHORN_NO_PROXY" != "1" ]]; then
+      warn "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-<unset>} is not the local proxy"
+      warn "on :${LITELLM_PORT}; skipping the proxy start-up check."
+    fi
+    LANTHORN_NO_PROXY=1
+    ;;
+esac
+
+port_answers() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' \
+      "http://127.0.0.1:${LITELLM_PORT}/health/liveliness" --max-time 2 || true)"
+  [[ "$code" == "200" ]]
+}
+
+ensure_proxy() {
+  [[ "$LANTHORN_NO_PROXY" == "1" ]] && return 0
+  port_answers && return 0
+
+  if [[ ! -x "$LITELLM_SERVICE" ]]; then
+    warn "proxy not answering on :${LITELLM_PORT}, and no service manager at"
+    warn "$LITELLM_SERVICE. Run ./setup.sh, or set LANTHORN_NO_PROXY=1."
+    return 1
+  fi
+
+  info "LiteLLM proxy not answering on :${LITELLM_PORT} — starting it..."
+  # Invoke as a SUBPROCESS, never `source`: start-litellm.sh's trailing `case`
+  # runs on load, and its functions call `exit`.
+  if "$LITELLM_SERVICE" start; then
+    info "proxy is up."
+    return 0
+  fi
+  warn "could not start the proxy — see $LITELLM_LOG"
+  return 1
+}
+
+# Serialize cold starts: do_start() has a check-then-act window, so two racing
+# invocations would both spawn litellm and leave an orphan on the port.
+#
+# Close the lock fd before exec. Without that, the harness (and any LiteLLM
+# it later starts) inherits the open file and holds the lock for the whole
+# session — an in-TUI switch then blocks on flock until start_proxy times out,
+# even though a manual start takes a few seconds.
+if command -v flock >/dev/null 2>&1 && [[ "$LANTHORN_NO_PROXY" != "1" ]]; then
+  exec 9>"${TMPDIR:-/tmp}/lanthorn-proxy.lock"
+  flock 9
+  ensure_proxy || true
+  flock -u 9
+  exec 9>&-
+else
+  ensure_proxy || true
+fi
+
+if [[ "$LANTHORN_REQUIRE_PROXY" == "1" ]] && ! port_answers; then
+  die "proxy is not healthy on :${LITELLM_PORT} and LANTHORN_REQUIRE_PROXY=1."
+fi
+
+# --- hand off ----------------------------------------------------------------
+
+# Make the package importable regardless of the caller's cwd. The path goes on
+# PYTHONPATH in the spelling the *interpreter* reads, which is not always the
+# spelling the shell uses:
+#
+#   Windows Python reads the list itself, with ";" between entries, and an MSYS
+#   path (/c/Users/...) in it is resolved against the current drive -- so the
+#   entry is dead weight at best and a wrong directory at worst. The form it
+#   wants is a drive letter and forward slashes (C:/Users/x).
+#
+#   Under MSYS/Cygwin a backslash in an exported value is a character the shell
+#   consumes, so a value exported as C:\Users\x can reach the child with its
+#   separators stripped (C:Usersx) and stop resolving. Forward slashes have no
+#   such hazard.
+#
+#   A POSIX build of Python on the same host -- a Cygwin or MSYS python, which
+#   is what "python3" is on some Git Bash installs -- wants exactly the opposite:
+#   a POSIX path with ":" between entries, and it would read C:/Users/x as a
+#   relative directory named "C:". So which form to use is decided by asking
+#   the interpreter, not by asking the shell. On Linux and macOS both spellings
+#   are the POSIX one.
+_py_is_native_windows() {
+  "$PY" -c 'import os, sys; sys.exit(0 if os.name == "nt" else 1)' </dev/null >/dev/null 2>&1
+}
+
+_add_pythonpath() {
+  if [[ -n "${PYTHONPATH:-}" ]]; then
+    PYTHONPATH="$1${_PYTHONPATH_SEP}${PYTHONPATH}"
+  else
+    PYTHONPATH="$1"
+  fi
+  export PYTHONPATH
+}
+
+_PYTHONPATH_SEP=":"
+if command -v cygpath >/dev/null 2>&1 && _py_is_native_windows; then
+  _win_root="$(cygpath -w "$LANTHORN_ROOT" 2>/dev/null || true)"
+  if [[ -n "$_win_root" ]]; then
+    # Backslashes are for cygpath's output only: an exported value travels
+    # through the shell, which eats them.
+    _add_pythonpath "${_win_root//\\//}"
+    # The checkout comes first on purpose. A native Windows Python started from
+    # a Cygwin shell takes the Windows spelling of the list, and anything
+    # earlier in it wins -- an inherited PYTHONPATH pointing at another
+    # checkout, say, would put that copy of the package in front of this one
+    # and the launch would run code that is not installed here.
+    _PYTHONPATH_SEP=";"
+  else
+    _add_pythonpath "$LANTHORN_ROOT"
+  fi
+else
+  _add_pythonpath "$LANTHORN_ROOT"
+fi
+
+# Exported so the harness can find this launcher again. After a launch-time
+# update replaces the code, __main__ re-execs *through this script* rather than
+# straight to the interpreter, so the dependency sync above runs against the
+# requirements.txt the update just pulled. Without the export it would have to
+# guess the path.
+export LANTHORN_ROOT
+
+# exec: no extra bash layer, so exit status, signal delivery and TTY ownership
+# all belong to the harness. NOTE: exec discards EXIT traps.
+exec "$PY" -m lanthorn "$@"

@@ -1,0 +1,159 @@
+# The Logfare catalog, refreshed against the upstream's own status API:
+#
+#     https://logfare.ai/v1/status?hours=24
+#
+# Only models that advertise `chat/completions` are registered here; the
+# image/TTS/STT models the catalog also lists (flux-*, sdxl-lightning,
+# whisper-large-v3-turbo, aura-2-en, nova-3, phoenix-1.0, lucid-origin) do not
+# support chat and are deliberately omitted.
+#
+# Every chat model Logfare serves is registered below, plus a `*` wildcard so a
+# model Logfare adds later works without editing this file. The named entries
+# win over the wildcard (LiteLLM resolves an exact model_name first), which is
+# what lets the aliases at the bottom pin a haiku name to a live model.
+#
+# `lanthorn/logfare.py` fetches the live catalog and /logfare-models shows what
+# it found; /model is built from that list, not from this file. Keeping the two
+# in step still matters for the *fallback* path — sources.LOGFARE_MODELS and
+# config.KNOWN_MODELS are what /model shows before the first fetch.
+general_settings:
+  # Required since litellm 1.104: without a master key the proxy refuses to
+  # start, because it would otherwise accept every request with no
+  # authentication. This proxy is a local translation shim in front of Logfare,
+  # not a multi-tenant gateway, so the harness's own upstream token doubles as
+  # the proxy credential — Lanthorn already sends it as x-api-key, so the
+  # request that worked before keeps working, while anything else on the box
+  # that finds the port is now rejected.
+  master_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+model_list:
+  # --- DeepSeek ---------------------------------------------------------------
+  # deepseek-v4.1-flash-1017 is the shipped default (DEFAULT_MODEL /
+  # MODEL_DEFAULT) and the only model with a solid uptime record, so it leads.
+  # The undated name below is kept as an alias for profiles that still export
+  # it; upstream answers 404 for it directly.
+  - model_name: deepseek-v4.1-flash
+    litellm_params:
+      model: openai/deepseek-v4.1-flash
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  # --- Qwen / Gemma -----------------------------------------------------------
+  - model_name: qwen-3.8-27b
+    litellm_params:
+      model: openai/qwen-3.8-27b
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  # gemma-4-26b is the weakest of the four upstream — Logfare reports it
+  # "unstable" at ~40% uptime — but it is genuinely served, so it stays
+  # selectable rather than being hidden. /model says so beside the name.
+  - model_name: gemma-4-26b
+    litellm_params:
+      model: openai/gemma-4-26b
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  # --- Router -----------------------------------------------------------------
+  # Logfare's own model picker: routes to whichever of the above is healthiest.
+  - model_name: logfare/auto
+    litellm_params:
+      model: openai/logfare/auto
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  # --- The rest of Logfare's chat catalog -------------------------------------
+  # Live as of 2026-11-11, from /v1/status filtered on chat/completions. The
+  # wildcard below would route these anyway; they are named so the proxy's own
+  # /v1/models lists them, and so a model that is *removed* upstream is still a
+  # deliberate edit here rather than silently disappearing.
+  #
+  # Refreshed from the 2026-10-19 set: claude-haiku-5-5 and deepseek-v4-pro-0813
+  # were retired upstream, and deepseek-v4.1-flash now answers only as the dated
+  # -1017 snapshot.
+  #
+  # Premium entries require a one-time training opt-in on the account; until
+  # that is granted the upstream answers 403 training_optin_required. That is
+  # the account's state, not a fault in this file.
+  - model_name: glm-5.3
+    litellm_params:
+      model: openai/glm-5.3
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  - model_name: glm-5.3-flash
+    litellm_params:
+      model: openai/glm-5.3-flash
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  - model_name: kimi-k2.6
+    litellm_params:
+      model: openai/kimi-k2.6
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  - model_name: deepseek-v4.1-flash-1017
+    litellm_params:
+      model: openai/deepseek-v4.1-flash-1017
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  - model_name: economy/deepseek-v4.1-flash
+    litellm_params:
+      model: openai/economy/deepseek-v4.1-flash
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  - model_name: gemma-4-31b-it
+    litellm_params:
+      model: openai/gemma-4-31b-it
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  - model_name: glm-5.2
+    litellm_params:
+      model: openai/glm-5.2
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  - model_name: kimi-k2.7-code
+    litellm_params:
+      model: openai/kimi-k2.7-code
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  # --- Wildcard ---------------------------------------------------------------
+  # Any chat model Logfare adds later, without waiting for a Lanthorn release.
+  # `openai/*` forwards the requested name upstream verbatim, which is exactly
+  # what this proxy is for. It is a fallback, never a preferred route: the
+  # named entries above match first, and a name Logfare does not serve simply
+  # 404s upstream instead of being rejected here.
+  - model_name: "*"
+    litellm_params:
+      model: openai/*
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  # Claude Code probes/streams with a "small fast" model too; map the usual
+  # haiku names onto a live upstream model so background requests don't 404.
+  # These are aliases, not catalog entries — they exist so a client that hard-
+  # codes a haiku name still works, and they are deliberately kept out of
+  # /model by not being listed in sources.LOGFARE_MODELS.
+  - model_name: claude-3-5-haiku-latest
+    litellm_params:
+      model: openai/deepseek-v4.1-flash-1017
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  - model_name: claude-3-5-haiku
+    litellm_params:
+      model: openai/deepseek-v4.1-flash-1017
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: openai/deepseek-v4.1-flash-1017
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN

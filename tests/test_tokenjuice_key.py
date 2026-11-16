@@ -1,0 +1,423 @@
+"""Regression suite for `/tokenjuice-api-setup` — your own key.
+
+Run:  python tests/test_tokenjuice_key.py
+
+The operator asked for a command that lets anyone set up their own Token Juice
+key, "but keep the public api keys public". Those are two requirements, and the
+second is the one that can be broken by accident. The shipped profile used to
+carry a shared working key; it is now a template with an empty token, so:
+
+1. **A personal key wins, locally.** Written to
+   ``$LANTHORN_HOME/tokenjuice/source``, mode 600, read before anything in the
+   tree. ``tokenjuice_status()`` has to say *which* file is in force, because
+   "a key is set" and "the template is all there is" are different answers and
+   only one of them is visible otherwise. A blank token is never reported as a
+   credential.
+2. **The template is never written.** ``packaging/tokenjuice/source`` is
+   deliberately committed — with no key — so a fresh clone knows the route
+   and nothing can be spent. Every check here compares its bytes before and
+   after a save and a clear.
+3. **``clear`` goes back, it does not break.** Only the personal file is
+   removed; with nothing personal left the route reports no key.
+4. **The key is never echoed.** The confirmation carries the last four
+   characters, and the transcript is checked for the whole key.
+
+No network: the UI checks drive `_handle_command` with the client untouched.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
+
+from lanthorn import sources  # noqa: E402
+from lanthorn.config import Config  # noqa: E402
+from lanthorn.ui.complete import SLASH_COMMANDS  # noqa: E402
+from support import private_dir_ok, private_file_ok  # noqa: E402
+
+RESULTS: list[tuple[str, bool, str]] = []
+
+#: A shape-valid key that is not a real credential. Never used against anything.
+KEY = "tj_test_0000000000000000abcd"
+SHIPPED = (
+    "# Lanthorn — Token Juice profile (template).\n"
+    'export ANTHROPIC_BASE_URL="https://api.tokenjuice.ai/v1"\n'
+    'export ANTHROPIC_AUTH_TOKEN=""\n'
+    'export ANTHROPIC_MODEL="deepseek-ai/DeepSeek-V4.1-Flash-1017"\n'
+    'export ANTHROPIC_API_KEY=""\n'
+)
+
+
+def check(name: str, ok: bool, extra: str = "") -> None:
+    RESULTS.append((name, ok, extra))
+    print(f"{'PASS' if ok else 'FAIL'}  {name}  {extra}")
+
+
+def _sandbox(tmp: Path) -> tuple[Path, Path]:
+    """Point every profile rung at the temp dir, and ship the shared key.
+
+    All three module globals are patched, not just ``LANTHORN_HOME``: the
+    candidate chain is personal → legacy → shipped, and a test that patched one
+    of them would read the real ``~/.lanthorn`` and pass for the wrong reason.
+    """
+    zhome = tmp / "lanthorn"
+    home = tmp / "home"
+    root = tmp / "root"
+    (root / "packaging" / "tokenjuice").mkdir(parents=True, exist_ok=True)
+    (root / "packaging" / "tokenjuice" / "source").write_text(
+        SHIPPED, encoding="utf-8")
+    sources.LANTHORN_HOME = zhome
+    sources.DEFAULT_HOME = home
+    sources.DEFAULT_ROOT = root
+    return zhome, root
+
+
+def _shipped(root: Path) -> Path:
+    return root / "packaging" / "tokenjuice" / "source"
+
+
+# ---------------------------------------------------------------------------
+# 1 — the key shape
+# ---------------------------------------------------------------------------
+
+def test_key_shape(tmp: Path) -> None:
+    check("shape: a tj_ key is accepted", sources.is_tokenjuice_key(KEY))
+    check("shape: an export line is not a key",
+          not sources.is_tokenjuice_key(f'export ANTHROPIC_AUTH_TOKEN="{KEY}"'))
+    check("shape: another prefix is not a key",
+          not sources.is_tokenjuice_key("sk-" + "a" * 40))
+    check("shape: too short is not a key", not sources.is_tokenjuice_key("tj_"))
+    check("shape: empty is not a key", not sources.is_tokenjuice_key(""))
+    check("shape: None is not a key", not sources.is_tokenjuice_key(None))
+
+
+# ---------------------------------------------------------------------------
+# 2 — which credential is in force
+# ---------------------------------------------------------------------------
+
+def test_status(tmp: Path) -> None:
+    zhome, root = _sandbox(tmp / "a")
+    st = sources.tokenjuice_status()
+    check("status: a template with no token is not a credential",
+          st.origin == "", st.origin)
+    check("status: and it names no file as in force",
+          st.path is None, str(st.path))
+
+    # A personal key on disk wins over the shipped one, with no repository
+    # change at all.
+    path = sources.save_token(KEY)
+    st = sources.tokenjuice_status()
+    check("status: a personal key takes over", st.origin == "personal",
+          st.origin)
+    check("status: the personal file is the one named",
+          st.path == path == zhome / "tokenjuice" / "source", str(st.path))
+    check("status: the tail is the last four, not the key",
+          st.tail == "abcd", st.tail)
+    check("status: the upstream is read from the profile",
+          st.base_url == "https://api.tokenjuice.ai/v1", st.base_url)
+    check("status: the tail follows the personal key", st.tail == "abcd",
+          st.tail)
+    check("status: the personal key is personal", st.is_personal)
+
+    # The older layout is still read, so an existing install keeps working.
+    sources.clear_token()
+    legacy = tmp / "a" / "home" / "claude-source"
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / "deepseek-claude").write_text(
+        'export ANTHROPIC_AUTH_TOKEN="tj_legacy_0000000000009999"\n',
+        encoding="utf-8")
+    st = sources.tokenjuice_status()
+    check("status: the older layout is still found", st.origin == "legacy",
+          st.origin)
+    check("status: a legacy key counts as personal", st.is_personal)
+
+
+# ---------------------------------------------------------------------------
+# 3 — writing a key
+# ---------------------------------------------------------------------------
+
+def test_save(tmp: Path) -> None:
+    zhome, root = _sandbox(tmp / "b")
+    before = _shipped(root).read_bytes()
+
+    path = sources.save_token(KEY)
+    check("save: the profile is written where it is read from",
+          path == zhome / "tokenjuice" / "source", str(path))
+    ok, detail = private_file_ok(path)
+    check("save: the file is mode 600", ok, detail)
+    ok, detail = private_dir_ok(path.parent)
+    check("save: the directory is mode 700", ok, detail)
+    body = path.read_text(encoding="utf-8")
+    check("save: the key is in the file", KEY in body)
+    check("save: the upstream came from the shipped template",
+          "https://api.tokenjuice.ai/v1" in body)
+    check("save: ANTHROPIC_API_KEY stays empty so the token wins",
+          'export ANTHROPIC_API_KEY=""' in body)
+    check("save: the template is byte-for-byte untouched",
+          _shipped(root).read_bytes() == before)
+
+    # Twice is a rewrite, not an append: two AUTH_TOKEN lines would leave the
+    # shell and the harness disagreeing about which key is in force.
+    sources.save_token(KEY + "9")
+    body = path.read_text(encoding="utf-8")
+    check("save: a second key replaces the first",
+          body.count("ANTHROPIC_AUTH_TOKEN=") == 1
+          and (KEY + "9") in body, str(body.count("ANTHROPIC_AUTH_TOKEN=")))
+
+
+# ---------------------------------------------------------------------------
+# 4 — removing a key
+# ---------------------------------------------------------------------------
+
+def test_clear(tmp: Path) -> None:
+    zhome, root = _sandbox(tmp / "c")
+    before = _shipped(root).read_bytes()
+    check("clear: nothing to clear is not an error",
+          sources.clear_token() is None)
+
+    path = sources.save_token(KEY)
+    removed = sources.clear_token()
+    check("clear: the personal file is removed", removed == path, str(removed))
+    check("clear: the file is gone", not path.exists())
+    check("clear: no key is in force again",
+          sources.tokenjuice_status().origin == "")
+    check("clear: the template survives the clear",
+          _shipped(root).read_bytes() == before)
+    check("clear: clearing twice is not an error",
+          sources.clear_token() is None)
+
+
+# ---------------------------------------------------------------------------
+# 5 — wiring: every surface a grep finds
+# ---------------------------------------------------------------------------
+
+def test_wiring(tmp: Path) -> None:
+    from lanthorn.ui.app import LanthornApp
+
+    app_src = (ROOT / "lanthorn" / "ui" / "app.py").read_text(encoding="utf-8")
+    check("wiring: dispatch has the canonical spelling",
+          '"tokenjuice-api-setup": lambda a: self._cmd_tokenjuice_key(a)'
+          in app_src)
+    check("wiring: dispatch has the short spelling",
+          '"tokenjuic-api-setup": lambda a: self._cmd_tokenjuice_key(a)'
+          in app_src)
+    check("wiring: the help table names it",
+          '("/tokenjuice-api-setup [key|clear]"' in app_src)
+    check("wiring: the help table does not promise a shared key",
+          "fall back to the shared" not in app_src)
+    check("wiring: the palette names it",
+          '"/tokenjuice-api-setup", "store or remove your own Token Juice key"'
+          in app_src)
+    check("wiring: it answers while busy",
+          "tokenjuice-api-setup" in LanthornApp.BUSY_OK)
+    check("wiring: the completion popup lists it",
+          "/tokenjuice-api-setup" in [n for n, _ in SLASH_COMMANDS])
+    check("wiring: the completion popup does not list the typo",
+          "/tokenjuic-api-setup" not in [n for n, _ in SLASH_COMMANDS])
+
+    # The agent has to be able to *name* the command, or "set up my token juice
+    # key" sends it looking for a file to edit. The environment note is where it
+    # learns that.
+    from lanthorn.agent import Agent
+
+    cfg = Config.from_env(workdir=tmp, api_key="x",
+                          base_url="http://localhost:4001")
+    note = Agent(cfg).system_prompt()
+    check("wiring: the environment note names the command",
+          "/tokenjuice-api-setup" in note)
+    check("wiring: the environment note names the profile",
+          str(sources.tokenjuice_profile()) in note)
+
+
+# ---------------------------------------------------------------------------
+# 6 — driven through the live TUI
+# ---------------------------------------------------------------------------
+
+async def test_ui(tmp: Path) -> None:
+    from lanthorn.ui.app import LanthornApp
+
+    zhome, root = _sandbox(tmp / "d")
+    before = _shipped(root).read_bytes()
+
+    cfg = Config.from_env(workdir=tmp, api_key="x",
+                          base_url="http://localhost:4001", boot_rain=False)
+    cfg.state_dir = tmp / "ui-state"
+    app = LanthornApp(cfg)
+
+    async with app.run_test(size=(110, 40)) as pilot:
+        app.pop_screen()
+        await pilot.pause()
+
+        app._handle_command("/tokenjuice-api-setup")
+        await pilot.pause()
+        blob = "\n".join(s.text for s in app.query_one("#transcript").lines)
+        check("ui: bare command says no key is set",
+              "nothing found" in blob, blob[-500:])
+        check("ui: it says no key ships with the tool",
+              "no key ships with the tool" in blob, blob[-500:])
+        check("ui: it names the command that sets one",
+              "/tokenjuice-api-setup tj_" in blob, blob[-500:])
+
+        # The short spelling, deliberately: it is the name that was asked for.
+        app._handle_command(f"/tokenjuic-api-setup {KEY}")
+        await pilot.pause()
+        blob = "\n".join(s.text for s in app.query_one("#transcript").lines)
+        personal = zhome / "tokenjuice" / "source"
+        check("ui: the short spelling saves the key", personal.exists())
+        check("ui: the confirmation names the last four",
+              "…abcd" in blob, blob[-500:])
+        check("ui: the whole key is never echoed", KEY not in blob)
+        check("ui: the template is untouched by the save",
+              _shipped(root).read_bytes() == before)
+        check("ui: the session is told to switch route",
+              "/source-tokenjuice" in blob, blob[-500:])
+
+        app._handle_command("/tokenjuice-api-setup clear")
+        await pilot.pause()
+        blob = "\n".join(s.text for s in app.query_one("#transcript").lines)
+        check("ui: clear removes the personal key", not personal.exists())
+        check("ui: clear says no key is set",
+              "no Token Juice key is set" in blob, blob[-500:])
+        check("ui: clear says the template was not touched",
+              "template in the tree was not touched" in blob, blob[-500:])
+
+        app._handle_command("/tokenjuice-api-setup not-a-key")
+        await pilot.pause()
+        blob = "\n".join(s.text for s in app.query_one("#transcript").lines)
+        check("ui: a non-key is refused", "does not look like a Token Juice key"
+              in blob, blob[-400:])
+
+
+async def test_ui_applies_to_the_live_route(tmp: Path) -> None:
+    """Setting a key while already on Token Juice must not need a restart.
+
+    The client holds the token it read at switch time, so writing the file and
+    saying "saved" would leave the old key in force until the next launch.
+    """
+    from lanthorn.ui.app import LanthornApp
+
+    _sandbox(tmp / "e")
+    cfg = Config.from_env(workdir=tmp, api_key="", auth_token="tj_old_0000zzzz",
+                          base_url="https://api.tokenjuice.ai/v1",
+                          protocol="openai", boot_rain=False)
+    cfg.state_dir = tmp / "ui-state2"
+    app = LanthornApp(cfg)
+
+    async with app.run_test(size=(110, 40)) as pilot:
+        app.pop_screen()
+        await pilot.pause()
+        app._handle_command(f"/tokenjuice-api-setup {KEY}")
+        await pilot.pause()
+        blob = "\n".join(s.text for s in app.query_one("#transcript").lines)
+        check("live: the session token is replaced", cfg.auth_token == KEY,
+              str(cfg.auth_token))
+        check("live: the inherited API key is cleared", cfg.api_key == "",
+              repr(cfg.api_key))
+        check("live: the client is rebuilt on the next request",
+              app.agent._client is None)
+        check("live: the operator is told no restart is needed",
+              "no restart" in blob, blob[-500:])
+
+
+async def test_switch_live(tmp: Path) -> None:
+    """``/source-tokenjuice`` is a real switch again, spending the key in force.
+
+    The route has to move onto the upstream, take the token from the profile
+    chain (personal before the template), and remember the choice. ``<tj_ key>``
+    is the one-step "set it and switch", and it is now the *first* step too:
+    with no key shipping, a key typed here has to be the one the switch spends.
+    """
+    from unittest import mock
+
+    from lanthorn.ui.app import LanthornApp
+
+    zhome, _root = _sandbox(tmp / "p")
+    cfg = Config.from_env(workdir=tmp, api_key="x",
+                          base_url="http://localhost:4001", boot_rain=False)
+    cfg.state_dir = tmp / "ui-state3"
+    app = LanthornApp(cfg)
+
+    async with app.run_test(size=(110, 40)) as pilot:
+        app.pop_screen()
+        await pilot.pause()
+
+        # The switch probes the live catalog before it moves. Stub the probe:
+        # this suite is offline by design (see the module docstring), and the
+        # probe itself is covered by test_openai_compat.
+        with mock.patch.object(
+                LanthornApp, "_probe_direct",
+                return_value=("deepseek-ai/DeepSeek-V4.1-Flash-1017", None,
+                              True, "catalog not checked")):
+            app._handle_command(f"/source-tokenjuice {KEY}")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+        blob = "\n".join(s.text for s in app.query_one("#transcript").lines)
+        check("switch: the session moves to the upstream",
+              str(cfg.base_url) == "https://api.tokenjuice.ai/v1",
+              str(cfg.base_url))
+        check("switch: the key typed here is the one in force",
+              cfg.auth_token == KEY, str(bool(cfg.auth_token)))
+        check("switch: the inherited API key is cleared", cfg.api_key == "",
+              repr(cfg.api_key))
+        check("switch: the choice is remembered for the next launch",
+              (zhome / "current-source").read_text(encoding="utf-8").strip()
+              == "tokenjuice",
+              (zhome / "current-source").read_text(encoding="utf-8").strip())
+        check("switch: the one-step form still stores the personal key",
+              (zhome / "tokenjuice" / "source").exists())
+        check("switch: no pause notice survives",
+              "unlimited quota finished" not in blob
+              and "back in a few days" not in " ".join(blob.split()),
+              blob[-400:])
+        check("switch: the operator is told where it went",
+              "api.tokenjuice.ai" in blob, blob[-400:])
+        check("switch: the whole key is never echoed", KEY not in blob)
+
+
+def test_switch_wiring() -> None:
+    """Every surface that offers the route has to route the switch to it."""
+    app_src = (ROOT / "lanthorn" / "ui" / "app.py").read_text(encoding="utf-8")
+    complete_src = (ROOT / "lanthorn" / "ui" / "complete.py").read_text(
+        encoding="utf-8")
+    check("wiring: the dispatch switches, it does not pause",
+          '"source-tokenjuice": lambda a: self._cmd_switch_source("tokenjuice", a)'
+          in app_src)
+    check("wiring: the pause handler is gone",
+          "_cmd_tokenjuice_paused" not in app_src)
+    check("wiring: no surface still promises a wait",
+          "unlimited quota" not in app_src and "unlimited quota" not in complete_src)
+    check("wiring: the help table advertises the switch",
+          '"/source-tokenjuice", "switch upstream to Token Juice' in app_src)
+    check("wiring: the completion popup advertises the switch",
+          '("/source-tokenjuice", "switch upstream to Token Juice'
+          in complete_src)
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        test_key_shape(tmp)
+        test_status(tmp)
+        test_save(tmp)
+        test_clear(tmp)
+        test_wiring(tmp)
+        test_switch_wiring()
+        asyncio.run(test_ui(tmp))
+        asyncio.run(test_switch_live(tmp))
+        asyncio.run(test_ui_applies_to_the_live_route(tmp))
+
+    passed = sum(1 for _, ok, _ in RESULTS if ok)
+    print(f"\n{passed}/{len(RESULTS)} passed")
+    return 0 if passed == len(RESULTS) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

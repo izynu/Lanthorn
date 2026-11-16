@@ -1,0 +1,26 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Packaging / build artifacts
+*.egg-info/
+build/
+dist/
+
+# Virtualenvs — the user brings their own
+.venv/
+venv/
+
+# Credential profiles. A per-user profile is personal and must never be
+# committed; its `*.example` beside it is the committable template. Two are
+# deliberate exceptions, and neither carries a credential: Logfare's ships as a
+# template with a placeholder, and Token Juice's ships with an empty token —
+# the route and model id only, because a key committed to a public repo is a
+# budget anyone can spend. Flex's is a third kind of exception: it carries no
+# credential at all — the playground authenticates nothing — so it is a route
+# record, and /source-flex is documented as working on a fresh clone because
+# of it.
+packaging/*/source
+!packaging/logfare/source
+!packaging/tokenjuice/source
+!packaging/flex/source
