@@ -7,19 +7,31 @@ renders the CSS animations in place. Every animation is layered ON TOP of a
 fully-visible base state, so a renderer that samples the first frame (or
 ignores animation entirely) still shows the complete graphic.
 """
-import random, sys
+import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lanthorn.ui.banner import FONT, FONT_HEIGHT
 
 OUT = Path(__file__).resolve().parent
+# The plain palette: the colours the shell itself uses by default. One
+# foreground, one grey, and nothing that competes with the text — the neon
+# set these were before made the graphics look like a different product from
+# the one that launches.
 BG, GRID, GREEN, DIM, ACCENT, AMBER = (
-    "#040704", "#0a1a0d", "#00ff41", "#0c5a22", "#7dffb0", "#ffb000")
+    "#000000", "#141414", "#d4d4d4", "#6b6b6b", "#d4d4d4", "#d7ba7d")
 
 W, H = 1280, 420
 word, GW, SP, cell = "LANTHORN", 6, 1, 19
-total_cells = len(word) * GW + (len(word) - 1) * SP
-x0 = (W - total_cells * cell) / 2
+# Glyphs advance by ``GW + SP`` cells and each is ``GW`` wide, so the last
+# one's ink ends one column short of the pitch. Centre the ink, not the pitch.
+# The NUDGE is measured, not derived: this block font's letters are not all
+# six columns of solid fill (the "A" and "O" open with a blank column), so
+# centring the six-column cell leaves the visible word about one column right
+# of centre. One cell left of that is what a rendered frame measures even.
+pitch = len(word) * (GW + SP) - SP
+ink_cells = pitch - SP
+NUDGE = cell
+x0 = (W - ink_cells * cell) / 2 - NUDGE
 y0 = 126
 
 glyphs = []
@@ -43,91 +55,29 @@ for gi, ch in enumerate(word):
                   + "".join(rects) + "</g>")
 banner = "\n      ".join(glyphs)
 
-random.seed(7)
-rain = "\n      ".join(
-    f'<text class="rain" x="{18 + i*37 + random.randint(-6,6)}" y="-150" '
-    f'style="animation-duration:{random.uniform(3.4,8.2):.2f}s;'
-    f'animation-delay:-{random.uniform(0,6):.2f}s">'
-    + "".join(random.choice("0123456789ABCDEF") for _ in range(9)) + "</text>"
-    for i in range(34))
-
 sub_y = 288
 (OUT / "hero.svg").write_text(f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" aria-label="LANTHORN">
   <defs>
-    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
-      <feGaussianBlur stdDeviation="7" result="b"/>
-      <feMerge><feMergeNode in="b"/><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
-    <linearGradient id="rainfade" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="{GREEN}" stop-opacity="0.9"/>
-      <stop offset="100%" stop-color="{GREEN}" stop-opacity="0.04"/>
-    </linearGradient>
-    <linearGradient id="band" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%"   stop-color="{ACCENT}" stop-opacity="0"/>
-      <stop offset="50%"  stop-color="#ffffff" stop-opacity="0.55"/>
-      <stop offset="100%" stop-color="{ACCENT}" stop-opacity="0"/>
-    </linearGradient>
-    <linearGradient id="scan" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%"   stop-color="{GREEN}" stop-opacity="0"/>
-      <stop offset="50%"  stop-color="{GREEN}" stop-opacity="0.42"/>
-      <stop offset="100%" stop-color="{GREEN}" stop-opacity="0"/>
-    </linearGradient>
     <clipPath id="frame"><rect x="0" y="0" width="{W}" height="{H}" rx="10"/></clipPath>
   </defs>
 
   <style>
-    .rain {{ font: 16px ui-monospace, Menlo, Consolas, monospace;
-             fill: url(#rainfade); animation: fall linear infinite; }}
-    @keyframes fall {{ from {{ transform: translateY(0); }} to {{ transform: translateY({H+270}px); }} }}
-
-    /* Base state is fully visible; the loop only dips it briefly. */
-    .gl rect {{ fill: {GREEN};
-                animation: flicker 7s steps(1,end) infinite; }}
-    @keyframes flicker {{
-      0%, 88%   {{ opacity: 1; }}
-      89%       {{ opacity: 0.62; }}
-      90%       {{ opacity: 1; }}
-      91%       {{ opacity: 0.38; }}
-      92%, 100% {{ opacity: 1; }}
-    }}
-
-    .halo {{ animation: halo 3.6s ease-in-out infinite; }}
-    @keyframes halo {{ 0%,100% {{ opacity: .45; }} 50% {{ opacity: .95; }} }}
-
-    .band {{ animation: band 3.8s cubic-bezier(.4,0,.2,1) infinite; }}
-    @keyframes band {{ 0% {{ transform: translateX(-{W}px); }}
-                       55%,100% {{ transform: translateX({W}px); }} }}
-
-    .sweep {{ animation: sweep 5.4s linear infinite; }}
-    @keyframes sweep {{ 0% {{ transform: translateY(-90px); }} 100% {{ transform: translateY({H+90}px); }} }}
-
-    .cur {{ animation: blink 1.05s steps(1,end) infinite; }}
-    @keyframes blink {{ 0%,49% {{ opacity: 1; }} 50%,100% {{ opacity: 0; }} }}
+    .gl rect {{ fill: {GREEN}; }}
 
     .tag, .meta {{ paint-order: stroke; stroke: {BG}; stroke-width: 5;
                    stroke-linejoin: round; }}
     .tag {{ font: 600 15px ui-monospace, Menlo, Consolas, monospace;
-            letter-spacing: 3.2px; fill: {ACCENT}; }}
+            letter-spacing: 2px; fill: {DIM}; }}
     .meta {{ font: 13px ui-monospace, Menlo, Consolas, monospace;
              letter-spacing: 1.6px; fill: {DIM}; }}
 
-    @media (prefers-reduced-motion: reduce) {{
-      .rain, .gl rect, .band, .sweep, .cur, .halo {{ animation: none; }}
-    }}
   </style>
 
   <g clip-path="url(#frame)">
     <rect width="{W}" height="{H}" fill="{BG}"/>
-    <g opacity="0.5">{"".join(f'<line x1="0" y1="{y}" x2="{W}" y2="{y}" stroke="{GRID}"/>' for y in range(0, H, 26))}</g>
-    <g opacity="0.32">{rain}</g>
+    <g>{banner}</g>
 
-    <g filter="url(#glow)" class="halo">{banner}</g>
-
-    <rect class="band" x="0" y="{y0-16}" width="300" height="{FONT_HEIGHT*cell+32}"
-          fill="url(#band)" style="mix-blend-mode:screen"/>
-    <rect class="sweep" x="0" y="0" width="{W}" height="90" fill="url(#scan)"/>
-
-    <text class="tag" x="{W/2:.0f}" y="{sub_y}" text-anchor="middle">terminal-native // reads the repo, runs the work</text>
+    <text class="tag" x="{W/2:.0f}" y="{sub_y}" text-anchor="middle">reads the repo, runs the work</text>
 
     <text class="meta" x="{W/2:.0f}" y="360" text-anchor="middle" opacity="0.8">by Mr-Destroyer</text>
 
@@ -139,13 +89,12 @@ sub_y = 288
 
 # ------------------------------------------------------------ terminal ------
 LINES = [
-    ("prompt",  "recon the target and map the attack surface"),
-    ("dim",     "· enumerating · decrypting · probing"),
-    ("tool",    "bash  nmap -sV -p- target.example.com"),
-    ("ok",      "✓ 9 hosts up · 412 open ports · 0 blocked"),
-    ("tool",    "write_file  findings/attack-surface.md"),
-    ("ok",      "✓ diff applied  +84 −0"),
-    ("info",    "turn 3 · iter 7 · $0.0142 · 18.4k tok"),
+    ("prompt",  "add a rate limiter to the API client"),
+    ("dim",     "reading src/api/client.py"),
+    ("tool",    "bash  pytest tests/test_client.py -q"),
+    ("ok",      "9 passed in 0.31s"),
+    ("tool",    "write_file  src/util/limiter.py"),
+    ("ok",      "wrote src/util/limiter.py (42 lines)"),
 ]
 
 def terminal() -> str:
@@ -154,9 +103,9 @@ def terminal() -> str:
     rows = []
     for i, (kind, text) in enumerate(LINES):
         delay = 0.55 + i * 0.62
-        color = {"prompt": GREEN, "dim": DIM, "tool": ACCENT,
+        color = {"prompt": GREEN, "dim": DIM, "tool": DIM,
                  "ok": GREEN, "info": AMBER}[kind]
-        prefix = "› " if kind == "prompt" else ("  " if kind in ("ok", "dim", "info") else "$ ")
+        prefix = "❯ " if kind == "prompt" else ("  " if kind in ("ok", "dim", "info") else "  ")
         esc = (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
         rows.append(
             f'<text class="ln" x="{pad}" y="{top + i*lh}" fill="{color}" '
@@ -185,8 +134,8 @@ def terminal() -> str:
                        to   {{ transform: translateY(0); }} }}
     .cur {{ animation: blink 1.05s steps(1,end) infinite; }}
     @keyframes blink {{ 0%,49% {{ opacity: 1; }} 50%,100% {{ opacity: 0; }} }}
-    .title {{ font: 600 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-              letter-spacing: 2px; fill: {ACCENT}; }}
+    .title {{ font: 400 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+              fill: {DIM}; }}
     @media (prefers-reduced-motion: reduce) {{
       .ln {{ animation: none; opacity: 1; }} .cur {{ animation: none; }}
     }}
@@ -194,25 +143,31 @@ def terminal() -> str:
 
   <g clip-path="url(#tframe)">
     <rect width="{W}" height="{H}" fill="{BG}"/>
-    <rect width="{W}" height="46" fill="#0a140c"/>
+    <rect width="{W}" height="46" fill="#111111"/>
     <circle cx="28" cy="23" r="6.5" fill="#ff5f57"/>
     <circle cx="50" cy="23" r="6.5" fill="#febc2e"/>
     <circle cx="72" cy="23" r="6.5" fill="#28c840"/>
-    <text class="title" x="{W/2:.0f}" y="28" text-anchor="middle">lanthorn</text>
+    <text class="title" x="{W/2:.0f}" y="28" text-anchor="middle">Lanthorn</text>
     <line x1="0" y1="46" x2="{W}" y2="46" stroke="{DIM}" stroke-opacity="0.6"/>
 
-    <text x="{pad}" y="76" fill="{DIM}" style="font:13px ui-monospace,Menlo,monospace;letter-spacing:1.4px">
-      ◆ LANTHORN  ◆ AUTO  ◆ deepseek-v4.1-flash  ⛨ sandbox on  theme:green  ⌂ ~/projects/api
+    <text x="{pad}" y="76" fill="{ACCENT}" style="font:13px ui-monospace,Menlo,monospace">
+      <tspan font-weight="600">✳ Lanthorn</tspan><tspan fill="{DIM}">  v1.0.0</tspan>
     </text>
+    <text x="{pad}" y="96" fill="{ACCENT}" style="font:13px ui-monospace,Menlo,monospace">deepseek-v4.1-flash</text>
 
       {body}
 
-    <rect class="cur" x="{pad + 2}" y="{last_y + 22}" width="9" height="17" fill="{GREEN}" filter="url(#tglow)"/>
+    <rect class="cur" x="{pad}" y="{H-17}" width="9" height="14" fill="{GREEN}"/>
 
-    <line x1="0" y1="{H-42}" x2="{W}" y2="{H-42}" stroke="{DIM}" stroke-opacity="0.6"/>
-    <text x="{pad}" y="{H-17}" fill="{DIM}" style="font:13px ui-monospace,Menlo,monospace">
-      ● deepseek-v4.1-flash   |   tok ↑18.4k ↓612   |   $ 0.0142   |   turn 3   |   ● idle
+    <text x="{pad}" y="{H-46}" fill="{DIM}" style="font:13px ui-monospace,Menlo,monospace">
+      deepseek-v4.1-flash   ·   api   ·   ~/projects/api   ·   <tspan fill="{ACCENT}">auto</tspan>
     </text>
+    <text x="{pad}" y="{H-28}" fill="{DIM}" style="font:13px ui-monospace,Menlo,monospace">
+      ● idle   ·   auto mode
+    </text>
+    <rect x="{pad}" y="{H-20}" width="{W-2*pad}" height="0.5" fill="{DIM}"/>
+    <text x="{pad}" y="{H-6}" fill="{DIM}" style="font:13px ui-monospace,Menlo,monospace">❯ </text>
+    <rect x="0.5" y="0.5" width="{W-1}" height="{H-1}" rx="12" fill="none" stroke="{DIM}" stroke-opacity="0.55"/>
     <rect x="0.5" y="0.5" width="{W-1}" height="{H-1}" rx="12" fill="none" stroke="{DIM}" stroke-opacity="0.55"/>
   </g>
 </svg>

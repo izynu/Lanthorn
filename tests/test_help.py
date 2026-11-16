@@ -119,7 +119,10 @@ async def test_narrow(tmp: Path) -> None:
     from lanthorn.ui.app import LanthornApp
 
     app = LanthornApp(_cfg(tmp))
-    async with app.run_test(size=(100, 40)) as pilot:
+    # Under 100 cols, so the screen carries the narrow class. The rails are a
+    # display now and the shell opens without them either way; what makes this
+    # the narrow case is the width itself.
+    async with app.run_test(size=(92, 40)) as pilot:
         app.pop_screen()
         await pilot.pause()
         app._handle_command("/help")

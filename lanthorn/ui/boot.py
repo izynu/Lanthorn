@@ -111,7 +111,11 @@ class BootScreen(Screen):
         # SPIN_SHADES rather than inventing a second brightness curve. Testing
         # row by row instead lit the caps and dimmed the fill on an edge-on
         # frame, which reads as a mistake rather than as a turn.
-        lit = rows[1].strip()[:1] == "█"
+        # Lit on the frames facing the viewer. The emblem is drawn with line
+        # glyphs, not blocks, so there is no fill character to test for: the
+        # frame index says it, and it says it the same way for both facing
+        # frames — the near one and the far one the turn comes back to.
+        lit = self._phase != "banner" or self._spin_index() in (0, SPIN_FRAMES // 2)
         style = f"bold {self.palette.accent}" if lit else self.palette.dim
         t = Text(justify="center")
         for i, row in enumerate(rows):

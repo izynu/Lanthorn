@@ -21,13 +21,14 @@ from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.events import Click, MouseMove, MouseUp, TextSelected
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
+from .. import __version__
 from .. import ad as ad_mod
 from .. import aihubmix as ah_mod
 from .. import beatapi as bp_mod
@@ -65,8 +66,9 @@ from .. import wandb as wb_mod
 from ..agent import Agent, Deliverable
 from ..config import KNOWN_MODELS, MODES, Config, find_agents_file, price_for
 from ..scope import Scope
-from ..theme import (SYSTEM_THEME, THEME_NAMES, THINKING_VERBS, agent_color,
-                     get_palette, set_current_theme)
+from ..theme import (DEFAULT_THEME, SYSTEM_THEME, THEME_NAMES, THINKING_VERBS,
+                     agent_color, clear_current_theme, get_palette,
+                     set_current_theme)
 from . import renderers as R
 from .markdown import markdown_renderable
 from .boot import BootScreen
@@ -74,7 +76,8 @@ from .complete import CompletionPopup, _iter_files
 from .palette_cmd import CommandPalette, PaletteEntry
 from .rails import LoopRail, TelemetryRail
 from .web import WaveWeb
-from .widgets import ChatPane, HeaderBar, PromptInput, StatusBar, LanthornPane
+from .widgets import (ChatPane, LanthornPane, PromptInput, StatusBar,
+                      _billing_label, _git_branch, _short_cwd)
 
 
 #: What `/source-opencode` says while it works. Deliberately no counts: how many
@@ -1135,29 +1138,64 @@ class LanthornApp(App):
         width: 100%;
         height: 1fr;
     }
-    /* Below ~100 cols the rails are hidden by on_resize and the layout is
-       today's two-pane shell. The transcript is never the thing that shrinks. */
+    /* The rails are a display, not the shell: the transcript, the prompt and
+       the footer are the whole of the default screen, and the rails are put
+       away until asked for (Ctrl+T). The narrow rule below still wins over
+       the ``rails`` class, so a terminal too narrow for them stays clean. */
+    LoopRail, TelemetryRail { display: none; }
+    Screen.rails LoopRail, Screen.rails TelemetryRail { display: block; }
     Screen.narrow LoopRail, Screen.narrow TelemetryRail { display: none; }
     /* LanthornPane stays up on a narrow terminal: the operator opened it on
        purpose, and close/minimize/resize are how they put it away. */
+    /* A positioner, not a layout: its children are docked to its own bottom
+       edge, and it holds no height of its own so the transcript reaches the
+       prompt's frame. `dock: bottom` + auto height made it lay its children
+       out itself and place every one of them at y=0. */
     #bottom-dock {
         dock: bottom;
         height: auto;
+        min-height: 5;
         layer: main;
     }
-    HeaderBar, StatusBar, Input { layer: main; }
+    StatusBar, Input { layer: main; }
 
     /* Colours come from theme variables, so /theme re-skins these too. */
-    #input {
+    /* One framed field, the only box on the screen. Textual has no
+       percentage margins and an auto margin is horizontal only, so the box
+       spans the width. */
+    /* Docked widgets on the same edge are all pinned to that edge rather
+       than stacked: the compositor records the tallest and puts every one at
+       the same y. The footer's own `margin: 0 0 3` is what lifts it clear of
+       the prompt's three rows, so the order here is the order on screen. The
+       box's height is stated rather than auto — a docked widget with
+       `height: auto` is measured before its child has a region, and the dock
+       collapses to zero height with its contents painted outside it. */
+    #prompt-box {
+        dock: bottom;
         height: 3;
-        border: round $primary;
+        width: 100%;
+        border: round $secondary;
+        background: $background;
+    }
+    #prompt-box > #input {
+        height: 1fr;
+    }
+    #prompt-box:focus-within {
+        border: round $accent;
+    }
+    #bottom-dock > StatusBar {
+        dock: bottom;
+        margin: 0 0 3 0;
+    }
+    /* The box draws the frame; the field's own chrome (border, padding,
+       scrollbar row) is reset in PromptInput.DEFAULT_CSS, which outranks this
+       sheet's `Input` rule. */
+    #input {
+        width: 100%;
         background: $background;
         color: $primary;
-        margin: 0;
-        padding: 0 1;
     }
     Input:focus {
-        border: round $accent;
         /* Textual tints the focused input with $foreground 5%, which renders as
            a shade outside the palette. Turn the tint off so the field keeps the
            palette background exactly. */
@@ -1285,6 +1323,8 @@ class LanthornApp(App):
         Binding("ctrl+d", "quit", "quit", priority=True),
         Binding("ctrl+l", "clear", "clear", priority=True),
         Binding("ctrl+k", "palette", "commands", priority=True),
+        Binding("ctrl+t", "toggle_rails", "rails", priority=True),
+        Binding("shift+tab", "cycle_mode", "mode", priority=True),
     ]
 
     def __init__(self, cfg: Config, term_bg: str | None = None,
@@ -1336,8 +1376,9 @@ class LanthornApp(App):
         # (a model reasons, answers, then reasons again after a tool result),
         # and because they commit to the transcript at different moments.
         self._reason_buf = ""
-        # across successive 1s ticks — no separate timer, and no rate to report
-        # while nothing is streaming.
+        # Session output tokens at the last 1s tick. The delta across successive
+        # ticks *is* the tokens-per-second rate, so the waveform needs no timer
+        # of its own — and no rate to report while nothing is streaming.
         self._last_output_tokens = 0
         # The prompt size of the most recent API call. That — not the session
         # cumulative input total — is how full the context window actually is:
@@ -1352,6 +1393,11 @@ class LanthornApp(App):
         # without this the synthesis turn would overwrite the bar and drop the
         # workers' tokens and cost — the team's spend would vanish from view.
         self._team_tokens: tuple[int, int, float] = (0, 0, 0.0)
+        #: Whether the operator wants the side rails on screen. The shell opens
+        #: without them; Ctrl+T brings them in. Held separately from the
+        #: widgets' ``display`` so a narrow terminal can hide them without
+        #: forgetting the wish.
+        self.rails_on = False
         # ---- /bug-hunt campaign state.
         # The stop flag is created once and reused, so /stop-hunt can set it
         # from the prompt while the hunt worker is mid-wave. _hunt_run is the
@@ -1390,8 +1436,8 @@ class LanthornApp(App):
         # RainRichLog) — Textual's compositor does not blend widgets across
         # layers, so a widget on a lower layer would be hidden by the panes.
         # The rails are deliberately crisp: no rain, so the numbers stay legible.
-        yield HeaderBar(self.palette, self.cfg.display_model, str(self.cfg.workdir),
-                        self.cfg.unsafe, self.theme_name, mode=self.cfg.mode)
+        # No title row: the splash at the top of the transcript already names
+        # the session, and a second name above it was the only chrome there was.
         with Horizontal(id="main"):
             yield LoopRail(self.palette)
             yield ChatPane(self.palette, rain=self.rain_on)
@@ -1401,12 +1447,34 @@ class LanthornApp(App):
             popup = CompletionPopup(self.palette, id="complete")
             popup.base_url = self.cfg.base_url
             yield popup
-            yield StatusBar(self.palette)
-            yield PromptInput(placeholder="❯ message Lanthorn…   ( / commands · @ files · ^K palette )",
-                              id="input")
+            # The box is a wrapper around the field, not the field's own
+            # border: the prompt glyph is drawn in the field's line, and a
+            # widget's border belongs to its frame rows, not to a line it
+            # renders — on the field itself the glyph would be painted over
+            # the top and bottom border as well. A plain Container, not a
+            # Vertical: Vertical's default 1fr height overrides the box's own
+            # `height: 3`, and the dock then arranges it over the footer.
+            with Container(id="prompt-box"):
+                yield PromptInput(
+                    placeholder="try \"add a rate limiter to the API client\"",
+                    id="input")
+            # The footer sits under the prompt, in the order it reads: what
+            # this session is, then what mode it is in and what it is doing.
+            bar = StatusBar(self.palette)
+            bar.mode = self.cfg.mode
+            bar.unsafe = self.cfg.unsafe
+            bar.set_session(session=self.cfg.workdir.name,
+                            cwd=_short_cwd(self.cfg.workdir),
+                            branch=_git_branch(self.cfg.workdir))
+            # Before boot hands over, the scope has not been read; "off" would
+            # be a claim about a guard that is about to be checked. ``_boot_done``
+            # sets the real badge.
+            bar.scope_ok = True
+            bar.scope_text = ""
+            yield bar
 
     def on_mount(self) -> None:
-        self.title = "LANTHORN"
+        self.title = "Lanthorn"
         try:
             theme = self.palette.rich_theme()
             self.register_theme(theme)
@@ -1431,8 +1499,7 @@ class LanthornApp(App):
         try:
             bar = self.query_one(StatusBar)
             n = len(text)
-            bar.set_activity(f"copied {n} char{'s' if n != 1 else ''}", busy=False)
-            bar.render_bar()
+            bar.note(f"copied {n} char{'s' if n != 1 else ''}")
         except Exception:
             pass
 
@@ -1506,10 +1573,12 @@ class LanthornApp(App):
         bar = self.query_one(StatusBar)
         bar.model = self.cfg.display_model
         bar.render_bar()
-        self.query_one(HeaderBar).set_scope(
-            self.agent.scope.badge(),
-            self.agent.scope.armed,
-        )
+        bar.set_scope(self.agent.scope.badge(), self.agent.scope.armed)
+        bar.set_mode(self.cfg.mode)
+        bar.unsafe = self.cfg.unsafe
+        bar.set_session(session=self.cfg.workdir.name,
+                        cwd=_short_cwd(self.cfg.workdir),
+                        branch=_git_branch(self.cfg.workdir))
         self._splash()
         # A session relaunched by `/panes` arrives with its conversation already
         # in `agent.messages` and an empty transcript pane — `/load` restores the
@@ -1744,21 +1813,29 @@ class LanthornApp(App):
         return text + "\n\n[referenced files]\n" + "\n\n".join(attached)
 
     def _splash(self) -> None:
-        """The banner, centred, at whatever width the transcript has now.
+        """The session header: name and version, then the facts, left-aligned.
 
-        Written as one renderable and centred by ``Align`` rather than padded
-        into place by hand. The transcript reflows every block it holds when a
-        rail is dragged (see ``RainRichLog._reflow``), so a banner centred in
-        the string would be correct at launch and off-centre from the first
-        resize onward; an ``Align`` re-centres on every re-render because the
-        renderable is kept, not the rendered lines.
+        Left, not centred. The shell is a terminal; a centred block reads as a
+        landing page, and every line after it — the answers, the tool results —
+        starts at the left margin. The header starts there too, so the screen
+        has one column to read down instead of two.
+
+        Written as one renderable so the transcript reflows it with everything
+        else when a rail is dragged (see ``RainRichLog._reflow``).
         """
-        from rich.align import Align
         from .banner import splash_mark
 
-        mark = splash_mark(self.palette, model=self.cfg.display_model,
-                           base_url=self.cfg.base_url)
-        self.query_one(ChatPane).write_block(Align.center(mark))
+        cfg = self.cfg
+        mark = splash_mark(
+            self.palette,
+            model=cfg.display_model,
+            base_url=cfg.base_url,
+            effort=cfg.reasoning_effort or "",
+            cwd=_short_cwd(cfg.workdir),
+            version=__version__,
+            billing=_billing_label(cfg),
+        )
+        self.query_one(ChatPane).write_block(mark)
 
     # ---- timers -----------------------------------------------------------
     def _status_bar(self) -> StatusBar | None:
@@ -1843,6 +1920,41 @@ class LanthornApp(App):
             screen.add_class("narrow")
         else:
             screen.remove_class("narrow")
+
+    # ---- rails ------------------------------------------------------------
+    def _apply_rails(self) -> None:
+        """Put the rails on screen or away, per ``rails_on``.
+
+        The class lives on the screen rather than on the rails themselves so
+        the CSS is one rule and the layout recomputes once. Called at boot,
+        from Ctrl+T, and after a `/clear`, which rebuilds the transcript and
+        is the moment an operator expects the shell to look like it did on
+        launch.
+        """
+        screen = self.screen
+        if screen is None:
+            return
+        if self.rails_on:
+            screen.add_class("rails")
+        else:
+            screen.remove_class("rails")
+
+    def action_toggle_rails(self) -> None:
+        self.rails_on = not self.rails_on
+        self._apply_rails()
+        if self.rails_on and self.size.width < 100:
+            self._sys_line("rails shown, but this terminal is too narrow for them", warn=True)
+        elif self.rails_on:
+            self._sync_rails()
+
+    def action_cycle_mode(self) -> None:
+        """Shift+Tab: the next mode, in the order /mode lists them."""
+        order = [m for m in MODES if m != "zim"]
+        try:
+            i = order.index(self.cfg.mode)
+        except ValueError:
+            i = -1
+        self._set_mode(order[(i + 1) % len(order)])
 
     def _flash_cursor(self) -> None:
         if not self.busy:
@@ -2819,8 +2931,15 @@ class LanthornApp(App):
 
         # A narrow pane cannot give a command column and a description column
         # enough room at once; the stacked form keeps the description readable
-        # by putting it underneath, indented past the command.
-        if width < 70:
+        # by putting it underneath, indented past the command. Below 100 the
+        # pane is that narrow whether or not the rails are up — the rails are
+        # a display now, and the transcript gets the whole width — so the
+        # screen's own narrow class decides, not the pane's measured width.
+        try:
+            screen_narrow = self.screen.has_class("narrow")
+        except Exception:  # noqa: BLE001 - no screen mid-teardown
+            screen_narrow = False
+        if width < 70 or screen_narrow:
             self.query_one(ChatPane).write_block(
                 Group(head, _help_stacked(groups, self.cfg.mode, width, p)))
             return
@@ -2871,7 +2990,8 @@ class LanthornApp(App):
         )
         table.add_row(
             Text("◈ KEYS", style=f"bold {p.accent}"),
-            Text("↑↓ move · Tab accept · Esc close · Ctrl+C stop · Ctrl+D exit",
+            Text("↑↓ move · Tab accept · Esc close · Ctrl+C stop · Ctrl+D exit"
+                 " · Ctrl+T rails · Shift+Tab mode",
                  style=p.dim),
         )
 
@@ -2915,7 +3035,7 @@ class LanthornApp(App):
     def _set_mode(self, name: str) -> None:
         self.cfg.mode = name
         self.agent.set_mode(name)
-        self.query_one(HeaderBar).set_mode(name)
+        self.query_one(StatusBar).set_mode(name)
         if name in ("auto-run", "zim"):
             # Re-resolve rather than trusting the launch-time value: a session
             # started in one directory and switched to auto-run from another (or
@@ -2969,6 +3089,10 @@ class LanthornApp(App):
         self._last_call_input = 0
         self._sync_rails()
         self._splash()
+        # A clear puts the shell back the way it opened: rails away unless the
+        # operator turned them on. The transcript is blank again, and a blank
+        # transcript with rails round it is not the launch screen.
+        self._apply_rails()
         self._sys_line("transcript and history cleared", ok=True)
 
     def _cmd_model(self, args) -> None:
@@ -3356,7 +3480,6 @@ class LanthornApp(App):
             return
         self.cfg.model = name
         self.agent.set_model(name)
-        self.query_one(HeaderBar).set_model(self.cfg.display_model)
         self.query_one(StatusBar).model = self.cfg.display_model
         self.query_one(StatusBar).render_bar()
         # Remember the choice when it is an AntSeed pin. Nothing else in the
@@ -4394,9 +4517,21 @@ class LanthornApp(App):
 
     def _cmd_theme(self, args) -> None:
         if not args:
-            self._sys_line("usage: /theme " + " | ".join(THEME_NAMES), warn=True)
+            self._sys_line("usage: /theme " + " | ".join([*THEME_NAMES, "default"]),
+                           warn=True)
             return
         name = args[0].lower()
+        if name == "default":
+            # Back to the plain shell *and* forget the colour, so the next
+            # launch is plain too. Remembering "default" is a name that is not
+            # a palette, and the launcher would have to know to skip it.
+            clear_current_theme()
+            self.theme_name = DEFAULT_THEME
+            self.palette = get_palette(DEFAULT_THEME, self.term_bg,
+                                       colors=self.term_colors)
+            self._apply_palette()
+            self._sys_line("theme switched to default", ok=True)
+            return
         if name not in THEME_NAMES:
             self._sys_line(f"unknown theme: {name}", warn=True)
             return
@@ -5689,9 +5824,11 @@ class LanthornApp(App):
                 self._sys_line(
                     "no personal key to clear — no Token Juice key is set")
             else:
-                self._sys_line(
-                    f"removed {removed} — no Token Juice key is set until you "
-                    "add one", ok=True)
+                # Two lines rather than one: the path can be long enough to
+                # push the half of the sentence that matters past the edge of
+                # the transcript, and "no key is set" is the fact being told.
+                self._sys_line(f"removed {removed}", ok=True)
+                self._sys_line("no Token Juice key is set until you add one")
             # The client holds the token it read at switch time, so a clear on
             # the live route has to reload it or the old key stays in memory
             # until the next launch — the "saved but not in force" failure the
@@ -6194,7 +6331,6 @@ class LanthornApp(App):
         self.cfg.protocol = "openai"
         self.cfg.model = model
         self.agent._client = None
-        self.query_one(HeaderBar).set_model(self.cfg.display_model)
         self.query_one(StatusBar).model = self.cfg.display_model
         self.query_one(StatusBar).render_bar()
         try:
@@ -6763,8 +6899,7 @@ class LanthornApp(App):
         remote host with neither, and this only ever needed the two words.
         """
         p = self.palette
-        # Same refresh _cmd_model does — HeaderBar + StatusBar carry the model.
-        self.query_one(HeaderBar).set_model(self.cfg.display_model)
+        # Same refresh _cmd_model does — the footer carries the model.
         self.query_one(StatusBar).model = self.cfg.display_model
         self.query_one(StatusBar).render_bar()
         # The popup offers this endpoint's catalog on `/model <TAB>`, so it has
@@ -6814,16 +6949,13 @@ class LanthornApp(App):
         except Exception:
             pass
 
-        h = self.query_one(HeaderBar)
-        h.palette = p
-        h.set_theme_name(self.theme_name)
-
         b = self.query_one(StatusBar)
         b.palette = p
         b.render_bar()
 
+        # The field itself has no border — the prompt box around it draws the
+        # frame — so only its text colour follows the palette here.
         inp = self.query_one(Input)
-        inp.styles.border = ("round", p.primary)
         inp.styles.color = p.primary
 
     def _cmd_save(self, args) -> None:
@@ -7078,8 +7210,8 @@ class LanthornApp(App):
             return
         ok, msg = session_mod.load(self.cfg, self.agent, args[0])
         if ok:
-            self.query_one(HeaderBar).set_model(self.cfg.display_model)
             self.query_one(StatusBar).model = self.cfg.display_model
+            self.query_one(StatusBar).render_bar()
             self._sys_line(msg, ok=True)
         else:
             self._sys_line(msg, warn=True)

@@ -1,8 +1,9 @@
-"""Hacker themes for the TUI.
+"""Themes for the TUI.
 
-Three fixed variants, each a tight palette so the whole UI reads as one neon
-system — no stray colors anywhere. Plus ``system``, which has no colours of its
-own: it takes the terminal's.
+``plain`` is the default and is not a theme so much as an absence of one: one
+foreground colour and a grey, with colour kept for errors and warnings. The
+three neon variants (green, amber, cyan) are opt-in, and ``system`` has no
+colours of its own: it takes the terminal's.
 
 The background is the terminal's own rather than a hardcoded black. A terminal
 paints its padding in its own background colour, and a TUI can only paint inside
@@ -16,7 +17,7 @@ that do not answer.
 foreground and the sixteen ANSI slots — so a scheme generator that re-themes
 the terminal (omarchy's ``aether``, which derives a scheme from each wallpaper)
 re-themes Lanthorn with it. See ``termcolors.py`` for how those are read. A slot
-the terminal does not report falls back to the green palette's value, so a
+the terminal does not report falls back to the default palette's value, so a
 partial answer degrades to something readable rather than to a hole.
 """
 
@@ -69,6 +70,21 @@ class Palette:
 
 
 PALETTES: dict[str, Palette] = {
+    # The default. The shell is meant to read like a terminal, not a theme: one
+    # foreground colour, a grey for the things that are only there to be
+    # ignored, and colour kept for the two states that are safety facts — an
+    # error, and a warning. Everything else in the UI asks for ``primary`` or
+    # ``dim``, so switching a role here changes the whole screen.
+    "plain": Palette(
+        name="lanthorn-plain",
+        bg="#000000",
+        primary="#d4d4d4",
+        dim="#6b6b6b",
+        accent="#d4d4d4",
+        red="#ff5f56",
+        amber="#d7ba7d",
+        glow="#d4d4d4",
+    ),
     "green": Palette(
         name="lanthorn-green",
         bg="#000000",
@@ -101,7 +117,7 @@ PALETTES: dict[str, Palette] = {
     ),
 }
 
-DEFAULT_THEME = "green"
+DEFAULT_THEME = "plain"
 
 #: The theme that takes its colours from the terminal rather than declaring
 #: them. It is not a key in ``PALETTES`` because there is nothing to look up —
@@ -121,12 +137,12 @@ def system_palette(colors: "TerminalColors | None" = None) -> Palette:
     The role mapping is the conventional one, so a scheme generator's intent
     comes through: the foreground becomes ``primary``, ANSI 8 (bright black) is
     the natural ``dim``, cyan and yellow are ``accent`` and ``amber``, and red
-    is ``red``. ``glow`` follows ``primary`` exactly as the green palette's does.
+    is ``red``. ``glow`` follows ``primary`` exactly as the default palette's does.
 
-    Every slot falls back to the green palette's value independently, so a
+    Every slot falls back to the default palette's value independently, so a
     terminal that answers only some of the sixteen degrades field by field
     rather than all at once — and a terminal that answers nothing gives exactly
-    the green palette, which is the honest default and not a broken one.
+    the default palette, which is the honest default and not a broken one.
     """
     base = PALETTES[DEFAULT_THEME]
     if colors is None:
@@ -158,7 +174,7 @@ def get_palette(name: str, bg: str | None = None, *,
 
     ``colors`` is the full terminal palette, used only by ``system``. It is
     keyword-only and optional so every existing caller — and every test that
-    calls ``get_palette("green", "#101315")`` — keeps its exact meaning.
+    calls ``get_palette("plain", "#101315")`` — keeps its exact meaning.
     """
     if name == SYSTEM_THEME:
         return system_palette(colors)
@@ -189,6 +205,18 @@ def current_theme() -> str | None:
     return name if name in THEME_NAMES else None
 
 
+def clear_current_theme() -> None:
+    """Forget the remembered choice, so the next launch opens plain.
+
+    Never fatal, for the same reason as :func:`set_current_theme`: a home that
+    cannot be written to must not take the TUI down with it.
+    """
+    try:
+        _theme_file().unlink()
+    except OSError:
+        pass
+
+
 def set_current_theme(name: str) -> None:
     """Record the choice. Never fatal — a read-only home must not break the TUI."""
     if name not in THEME_NAMES:
@@ -200,24 +228,18 @@ def set_current_theme(name: str) -> None:
         pass
 
 
-# Hacker verbs cycled by the "thinking" spinner.
+# Words cycled by the "thinking" readout while a turn waits on the model. They
+# say what is happening, in the plain register the rest of the shell uses; the
+# old list ("injecting", "exfiltrating") read as a costume rather than a status.
 THINKING_VERBS = [
-    "decrypting",
-    "probing",
-    "injecting",
-    "enumerating",
-    "sniffing",
-    "triangulating",
-    "fuzzing",
-    "exfiltrating",
-    "obfuscating",
-    "handshaking",
-    "compiling",
-    "negotiating",
-    "tracing",
-    "resolving",
-    "mutating",
-    "hashing",
+    "thinking",
+    "planning",
+    "working",
+    "reading",
+    "drafting",
+    "checking",
+    "reviewing",
+    "refining",
 ]
 
 # One colour per team worker, assigned by roster position so a worker keeps the
@@ -229,12 +251,12 @@ THINKING_VERBS = [
 # primary/accent/dim are already spoken for by the surrounding chrome. Each is
 # bright enough to read on any of the palettes' backgrounds.
 AGENT_COLORS = [
-    "#00ffaa",  # aqua
-    "#ffb000",  # amber
-    "#7dfff0",  # ice
-    "#ff8fd0",  # rose
-    "#b6ff6b",  # lime
-    "#ff6b6b",  # red
+    "#d4d4d4",  # white
+    "#8f8f8f",  # grey
+    "#c4a7e7",  # lilac
+    "#8fb8de",  # steel
+    "#d7ba7d",  # sand
+    "#a8c4a2",  # sage
 ]
 
 

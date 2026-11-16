@@ -39,6 +39,126 @@ class PromptInput(Input):
     corrupt every row beneath it.
     """
 
+    #: The prompt glyph, the same one the answer renderer puts before a reply.
+    PROMPT = "❯ "
+    PROMPT_WIDTH = len(PROMPT)
+
+    DEFAULT_CSS = """
+    PromptInput {
+        border: none;
+        height: 1;
+        padding: 0 2;
+        scrollbar-size-horizontal: 0;
+    }
+    """
+
+    def render_line(self, y: int):
+        """Draw the stock line, then paint the prompt glyph over its first cells.
+
+        The field is the only place the operator types, so it carries the same
+        ``❯`` the transcript uses for their words: it reads as one shell, not
+        a box with a field in it.
+
+        The glyph is written *over* the line rather than beside it. Every
+        cursor, selection and scroll offset in ``Input`` is measured from cell
+        zero, so shifting the text right would put the caret two cells ahead
+        of the character it is editing. Covering the first two cells keeps the
+        field's geometry exactly the stock field's, at the cost of the two
+        characters the glyph sits on — which is why the placeholder says "try"
+        and the operator's own text is scrolled only by ``content_width``,
+        two cells narrower, so the end of a long value stays in view.
+        """
+        from rich.segment import Segment
+        from rich.style import Style
+        from textual.strip import Strip
+
+        stock = super().render_line(y)
+        if y != 0:
+            return stock
+        # The placeholder is the one branch of the stock line that is written
+        # at full length rather than cropped to the field's width, so it is
+        # the one branch that has to be cut by hand. Focused, its first cell
+        # is the caret — its own segment, which blinks between the character
+        # and nothing — and the text behind it starts one cell in.
+        segments = [Segment(s.text, s.style) for s in stock._segments]
+        if not self.value:
+            if self.has_focus and segments and "input--cursor" in str(segments[0].style):
+                segments.pop(0)
+            drop = self.PROMPT_WIDTH
+            while drop > 0 and segments:
+                text, style = segments[0].text, segments[0].style
+                if len(text) > drop:
+                    segments[0] = Segment(text[drop:], style)
+                    break
+                drop -= len(text)
+                segments.pop(0)
+        # ``bgcolor`` from the field's own resolved style, not left unset: the
+        # rest of the line is painted edge to edge in the session background
+        # (the terminal's, when it reports one), and a glyph with no background
+        # would leave two cells of the terminal's padding colour inside the box.
+        from rich.style import Style as RichStyle
+
+        prompt = Segment(self.PROMPT, RichStyle(
+            color=self.accent, bgcolor=self._line_background()))
+        return Strip([prompt] + segments)
+
+    def _line_background(self):
+        """The field's resolved background, as a ``rich.color.Color``.
+
+        Textual and Rich both have a ``Color``; ``Style`` only accepts Rich's,
+        and the field's own background is already resolved by the time a line
+        is drawn, so it is taken from there rather than re-parsed from a
+        string — the session background can be the terminal's own, which has
+        no name.
+        """
+        from rich.color import Color as RichColor
+
+        bg = self.styles.background
+        return None if bg is None else RichColor.from_triplet(bg.rich_color.triplet)
+
+    @property
+    def content_width(self) -> int:
+        """The value's width, less the cells the glyph occupies.
+
+        ``Input`` renders the value to this width and crops to
+        ``scrollable_content_region``, so narrowing it here is what keeps the
+        caret on screen when the value is longer than the field: the stock
+        width would let the caret sit two cells past the visible edge.
+        """
+        return max(0, super().content_width - self.PROMPT_WIDTH)
+
+    def render_lines(self, crop):
+        """Draw the one row the field has.
+
+        The compositor hands this widget the framed box's whole interior, two
+        rows, and asks for both, with the box's padding baked into the crop.
+        ``Input`` only ever has one line of its own, so the second row would
+        be a blank painted over the frame's left and right edges. The stock
+        ``render_lines`` cannot be used for the one row either: it goes through
+        the style cache, whose bookkeeping assumes the widget is as tall as
+        the region it was given, and hands back the box's cached row instead
+        of this widget's own line. So the line is taken from ``render_line``
+        directly and given the padding the crop already carries. The ``crop``
+        argument's own column offset is already in the width.
+        """
+        from rich.segment import Segment
+        from textual.strip import Strip
+
+        width = crop.width
+        segments = list(self.render_line(0)._segments)
+        segments.insert(0, Segment(" " * self.styles.padding.left,
+                                   self.visual_style.rich_style))
+        line = Strip(segments).crop(0, width)
+        return [line.extend_cell_length(width, self.visual_style.rich_style)]
+
+    @property
+    def accent(self):
+        """The session palette's accent, for the prompt glyph."""
+        try:
+            return self.app.palette.accent  # type: ignore[attr-defined]
+        except Exception:
+            return None
+
     def _on_paste(self, event: events.Paste) -> None:
         """Insert the full pasted text, not just its first line.
 
@@ -91,114 +211,6 @@ class PromptInput(Input):
                 return index
             cell_offset += width
         return clamp(offset, 0, len(self.value))
-
-
-class HeaderBar(Static):
-    """Top bar: model, cwd, scope status, theme name."""
-
-    DEFAULT_CSS = """
-    HeaderBar {
-        dock: top;
-        height: 1;
-        padding: 0 1;
-    }
-    """
-
-    def __init__(self, palette: Palette, model: str, cwd: str, unsafe: bool, theme: str,
-                 mode: str = "auto", **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.palette = palette
-        self.model = model
-        self.cwd = cwd
-        self.unsafe = unsafe
-        self.theme_name = theme
-        self.mode = mode
-        self.scope_text = "off"
-        self.scope_ok = True
-
-    def set_scope(self, text: str, ok: bool) -> None:
-        self.scope_text = text
-        self.scope_ok = ok
-        self.refresh_content()
-
-    def set_model(self, model: str) -> None:
-        self.model = model
-        self.refresh_content()
-
-    def set_theme_name(self, name: str) -> None:
-        self.theme_name = name
-        self.refresh_content()
-
-    def set_mode(self, mode: str) -> None:
-        self.mode = mode
-        self.refresh_content()
-
-    def refresh_content(self) -> None:
-        p = self.palette
-        from ..config import MODES
-
-        m = MODES.get(self.mode, {})
-        # Modes marked "loud" (auto-run, danger, uncensored) are the armed states — shout them.
-        mstyle = f"bold white on {p.red}" if m.get("loud") else f"bold {p.accent}"
-        sep = ("  │  ", p.dim)
-
-        head = Text()
-        head.append("◈ LANTHORN", style=f"bold {p.primary}")
-        head.append(*sep)
-        head.append(f"◆ {m.get('label', self.mode.upper())} ", style=mstyle)
-        head.append(*sep)
-        head.append("◉ ", style=p.accent)
-        head.append(self.model, style=f"bold {p.accent}")
-
-        # Everything after the model is optional, in order of how little it
-        # matters. The bar is one row and Textual clips the overflow, so an
-        # over-long cwd would silently eat the scope status — the one field
-        # that says whether the sandbox is armed. So: build the tail, then
-        # drop the least important pieces until the whole thing fits the row
-        # we actually have. Measured, not guessed: a fixed width threshold is
-        # wrong the moment the cwd is a real project path rather than /tmp.
-        # Ordered least-important-LAST, because the fit loop pops from the end:
-        # the cwd goes first, then the theme, and the sandbox indicator — which
-        # is a security fact, not decoration — goes last. The cwd before the
-        # theme because a path is already on screen in the prompt and in every
-        # tool card, while the theme badge is the only sign of which palette is
-        # in force — and on Windows a real project path is long enough to cost
-        # both.
-        tail: list[tuple[str, object]] = [
-            ("⛨ sandbox on", p.dim),
-            (f"theme:{self.theme_name}", p.dim),
-            (f"⌂ {self.cwd}", p.primary),
-        ]
-        # The sandbox being OFF is not cosmetic — it never gets dropped.
-        if self.unsafe:
-            tail.insert(0, ("⚠ SANDBOX OFF", f"bold white on {p.red}"))
-            tail = [f for f in tail if f[0] != "⛨ sandbox on"]
-
-        # Scope sits between the fixed head and the droppable tail.
-        fixed = head.copy()
-        fixed.append(*sep)
-        fixed.append("⌖ scope ", style=p.dim)
-        fixed.append(self.scope_text, style=f"bold {p.accent if self.scope_ok else p.red}")
-
-        limit = self.size.width or 200
-        while tail:
-            t = fixed.copy()
-            for text, style in tail:
-                t.append(*sep)
-                t.append(text, style=style)
-            if t.cell_len <= limit:
-                self.update(t)
-                return
-            tail.pop()  # shed the least important field and try again
-        self.update(fixed)
-
-    def on_mount(self) -> None:
-        self.refresh_content()
-
-    def on_resize(self) -> None:
-        # The bar sheds fields by measured fit, so a resize can change what
-        # fits — re-lay it out rather than waiting for the next scope update.
-        self.refresh_content()
 
 
 class ChatPane(Vertical):
@@ -593,15 +605,31 @@ class ChatPane(Vertical):
 
 
 class StatusBar(Static):
-    """Bottom bar: tokens, cost, turns, iteration, elapsed, activity."""
+    """The footer under the prompt: what this session is, and what mode it is in.
+
+    Two rows, in the shape the operator asked for. The first is the session
+    facts, pipe-separated: model, session name, directory, git branch, mode.
+    The second is the mode line: what the mode does, the switch hint, and the
+    live activity readout (the spinner and what the agent is doing now).
+
+    The token, cost, turn and iteration counters are not here. They were the
+    loudest row on the screen and the least often read; they live in the
+    telemetry rail and `/cost`. Nothing that moves faster than a thought
+    belongs in the frame around the prompt.
+    """
 
     DEFAULT_CSS = """
     StatusBar {
-        height: 1;
+        height: 2;
         padding: 0 1;
         background: $background;
     }
     """
+
+    #: How long a "copied 12 chars" acknowledgement stays in the footer before
+    #: the idle readout returns. The copy itself is instant; the footer is the
+    #: only feedback there is for it, so it has to be up long enough to read.
+    NOTE_SECONDS = 2.5
 
     def __init__(self, palette: Palette, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -616,6 +644,21 @@ class StatusBar(Static):
         self.started = time.monotonic()
         self.busy = False
         self._verb_index = 0
+        #: Session name, shown in the first row. Set by the app once the
+        #: config is known; the directory's name is the sensible default.
+        self.session = ""
+        self.cwd = ""
+        self.branch = ""
+        self.mode = "auto"
+        #: Scope badge and whether the guard is armed. A security fact, so it
+        #: is never the field the footer sheds.
+        self.scope_text = "off"
+        self.scope_ok = True
+        self.unsafe = False
+        #: A short-lived acknowledgement ("copied 12 chars") and the clock time
+        #: it expires at. Shown instead of the idle readout until then.
+        self._note = ""
+        self._note_until = 0.0
         #: True while history is being compacted. The verb spinner must not
         #: overwrite the readout then — "compacting context" is the one thing
         #: worth saying, and it used to be replaced by "Pondering…" within a
@@ -628,11 +671,37 @@ class StatusBar(Static):
         #: the request takes.
         self._spin_frame = 0
 
+    # ---- setters ----------------------------------------------------------
     def set_activity(self, activity: str, busy: bool = False,
                      hold: bool = False) -> None:
         self.activity = activity
         self.busy = busy
         self.hold = hold
+        if not busy:
+            self._note = ""
+        self.render_bar()
+
+    def note(self, text: str) -> None:
+        """Show *text* in the footer for :data:`NOTE_SECONDS`, then revert."""
+        self._note = text
+        self._note_until = time.monotonic() + self.NOTE_SECONDS
+        self.render_bar()
+
+    def set_session(self, session: str = "", cwd: str = "",
+                    branch: str = "") -> None:
+        if session:
+            self.session = session
+        self.cwd = cwd
+        self.branch = branch
+        self.render_bar()
+
+    def set_mode(self, mode: str) -> None:
+        self.mode = mode
+        self.render_bar()
+
+    def set_scope(self, text: str, ok: bool) -> None:
+        self.scope_text = text
+        self.scope_ok = ok
         self.render_bar()
 
     def tick_compaction(self) -> None:
@@ -654,51 +723,120 @@ class StatusBar(Static):
         parameter — and it stays smooth when the bar is repainted for other
         reasons (a token delta, a tool activity) between ticks.
         """
+        if self._note and time.monotonic() >= self._note_until:
+            self._note = ""
+            self.render_bar()
+            return
         if not self.busy or self.hold:
             return
         self._spin_frame += 1
         self.render_bar()
 
-    def render_bar(self) -> None:
-        p = self.palette
-        elapsed = time.monotonic() - self.started
-        mm, ss = divmod(int(elapsed), 60)
+    # ---- rendering --------------------------------------------------------
+    def mode_line(self) -> str:
+        """The second row's mode text: what the current mode does."""
+        from ..config import MODES
+        m = MODES.get(self.mode, {})
+        label = str(m.get("label", self.mode.upper())).lower()
+        blurb = m.get("blurb") or "gated tools ask before they run"
+        return f"{label} mode · {blurb}"
 
-        t = Text()
-        t.append("◉ ", style=f"bold {p.accent}")
-        t.append(self.model, style=p.primary)
-        t.append("  │  ", style=p.dim)
-        t.append("tok ", style=p.dim)
-        t.append(f"↑{_k(self.input_tokens)}", style=p.primary)
-        t.append(" ", style=p.dim)
-        t.append(f"↓{_k(self.output_tokens)}", style=p.accent)
-        t.append("  │  ", style=p.dim)
-        t.append("$ ", style=p.dim)
-        t.append(f"{self.cost:.4f}", style=f"bold {p.accent}")
-        t.append("  │  ", style=p.dim)
-        t.append(f"turn {self.turns}", style=p.primary)
-        t.append("  │  ", style=p.dim)
-        t.append(f"iter {self.iterations}", style=p.dim)
-        t.append("  │  ", style=p.dim)
-        t.append(f"{mm:02d}:{ss:02d}", style=p.primary)
-        t.append("  │  ", style=p.dim)
-        if self.hold:
+    def render_bar(self) -> None:
+        """Draw the two rows: where this session is, and what it is doing.
+
+        Quiet on purpose. The operator asked for the plain shell, and the
+        footer is the one piece of chrome on screen the whole time — so it is
+        two grey lines under the prompt, not a status plate: no background
+        fill, no alarm colours except the ones that are safety facts (sandbox
+        off, scope lost), and the live readout in the same grey as the rest
+        until the agent is actually working. What is running is said by the
+        spinner and the verb; what the mode is comes after them.
+        """
+        self.update(self.bar_text())
+
+    def bar_text(self) -> Text:
+        """The footer's two rows, built but not drawn.
+
+        Separate from :meth:`render_bar` so the rows can be read — and
+        measured against the bar's width — without painting them.
+        """
+        p = self.palette
+        from ..config import MODES
+
+        m = MODES.get(self.mode, {})
+        sep = ("   ·   ", p.dim)
+        label = str(m.get("label", self.mode.upper())).lower()
+
+        # ---- row one: the session facts ----------------------------------
+        # Built as a list so the over-long fields can be shed by measured fit:
+        # the directory goes first (the session name is already there), and the
+        # branch next — while the mode, which says what tools may run
+        # unattended, is never dropped.
+        head = Text()
+        head.append(self.model, style=p.dim)
+        if self.session:
+            head.append(*sep)
+            head.append(self.session, style=p.dim)
+        tail: list[tuple[str, object]] = []
+        if self.branch:
+            tail.append((self.branch, p.dim))
+        if self.cwd:
+            tail.append((self.cwd, p.dim))
+        tail.append((label, p.primary))
+
+        limit = self.size.width or 200
+        while True:
+            row = head.copy()
+            for text, style in tail:
+                row.append(*sep)
+                row.append(str(text), style=style)
+            if row.cell_len <= limit or len(tail) <= 1:
+                break
+            tail.pop(0)  # shed the cwd, then the branch
+
+        # ---- row two: what is happening, then how to change it -----------
+        # The readout comes first and the mode second: the moving thing sits
+        # at a fixed column instead of being pushed around by the length of
+        # the mode's label.
+        line = Text()
+        if self._note:
+            line.append(self._note, style=p.primary)
+        elif self.hold:
             # Compaction: the bar carries its own spinner frame, advanced by the
             # animation timer, so the readout moves at the same rate as the
             # panel instead of the slower verb rotation.
             from .renderers import COMPACT_SPINNER
             spin = COMPACT_SPINNER[self._compact_frame % len(COMPACT_SPINNER)]
-            t.append(f"{spin} {self.activity}", style=f"bold {p.amber}")
+            line.append(f"{spin} {self.activity}", style=p.primary)
         elif self.busy:
             from .renderers import SPINNER_FRAMES
             spin = SPINNER_FRAMES[self._spin_frame % len(SPINNER_FRAMES)]
-            t.append(f"{spin} ", style=f"bold {p.accent}")
-            t.append(self.activity, style=f"bold {p.primary}")
+            line.append(f"{spin} {self.activity}", style=p.primary)
         else:
-            t.append(f"● {self.activity}", style=p.dim)
-        self.update(t)
+            line.append(f"● {self.activity}", style=p.dim)
+        line.append(*sep)
+        line.append(f"{label} mode", style=p.primary)
+        if self.unsafe:
+            line.append(*sep)
+            line.append("sandbox off", style=f"bold {p.red}")
+        elif not self.scope_ok:
+            line.append(*sep)
+            line.append(f"scope {self.scope_text}", style=f"bold {p.red}")
+
+        # ``no_wrap``: the rows are already shed to fit, and a word-wrap in the
+        # footer turns a tight row into three and pushes the prompt off the
+        # screen at a narrow width.
+        t = Text(no_wrap=True)
+        t.append_text(row)
+        t.append("\n")
+        t.append_text(line)
+        return t
 
     def on_mount(self) -> None:
+        self.render_bar()
+
+    def on_resize(self) -> None:
+        # Fields are shed by measured fit, so a resize changes what fits.
         self.render_bar()
 
 
@@ -1246,9 +1384,56 @@ class LanthornPane(Static):
         self.render_pane()
 
 
-def _k(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.1f}M"
-    if n >= 1000:
-        return f"{n/1000:.1f}k"
-    return str(n)
+def _short_cwd(path) -> str:
+    """A directory as the shell shows it: ``~/name`` under home, else as given.
+
+    The full path is long on Windows and the footer has one row; the home
+    directory is the one prefix that compresses without losing anything the
+    operator cannot reconstruct.
+    """
+    try:
+        from pathlib import Path as _P
+        home = _P.home()
+        p = _P(path)
+        rel = p.relative_to(home)
+        return "~" if str(rel) in ("", ".") else f"~/{rel.as_posix()}"
+    except Exception:
+        return str(path)
+
+
+def _git_branch(path) -> str:
+    """The checked-out branch, or ``""`` when *path* is not in a repository.
+
+    Read from ``.git/HEAD`` rather than by running git: the footer is painted
+    on the UI thread at boot, and a subprocess there can stall a terminal that
+    launches inside a large repository. A worktree or submodule, whose ``.git``
+    is a file, is walked up to the real repository when it is a plain one.
+    """
+    try:
+        from pathlib import Path as _P
+        d = _P(path).resolve()
+        for parent in [d, *d.parents]:
+            head = parent / ".git" / "HEAD"
+            if head.is_file():
+                text = head.read_text(encoding="utf-8", errors="replace").strip()
+                if text.startswith("ref: refs/heads/"):
+                    return text[len("ref: refs/heads/"):]
+                return "detached" if text else ""
+        return ""
+    except Exception:
+        return ""
+
+
+def _billing_label(cfg) -> str:
+    """How this session's calls are paid for, in a few words."""
+    try:
+        from .. import sources as _sources
+        src = _sources.discover().get(_sources.active_key(cfg.base_url) or "")
+        label = src.label if src is not None else ""
+    except Exception:
+        label = ""
+    if label:
+        return f"{label} billing"
+    if cfg.api_key_present:
+        return "API usage billing"
+    return "no API key"

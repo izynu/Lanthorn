@@ -202,7 +202,7 @@ async def _shot_boot(wd: Path) -> None:
     auto-continues 2.2s after the fade — so ~2.1s in is the frame where the
     whole checklist is legible and the ready line is up.
     """
-    app = LanthornApp(_cfg(wd, theme="green", allow_path=wd / "allow.yaml"))
+    app = LanthornApp(_cfg(wd, theme="plain", allow_path=wd / "allow.yaml"))
     async with app.run_test(size=BOOT_SIZE) as pilot:
         # Do NOT pop the boot screen: this shot *is* the boot screen.
         await pilot.pause()
@@ -216,13 +216,16 @@ async def _shot_shell(wd: Path) -> None:
     real = tools_mod.execute
     tools_mod.execute = _slow_execute(real)
     try:
-        app = LanthornApp(_cfg(wd, boot_rain=False, theme="green"))
+        app = LanthornApp(_cfg(wd, boot_rain=False, theme="plain"))
         app.agent = _stub(wd)
         async with app.run_test(size=SHELL_SIZE) as pilot:
             app.pop_screen()
             await pilot.pause()
             app.query_one("#input").focus()
             await pilot.pause()
+            # The default view is the plain one: rails hidden. The shot is of
+            # what a session looks like when it starts, not of the optional
+            # rails, so `ctrl+t` is not pressed here.
 
             # Seed the waveform and the file river so the rails read as busy
             # rather than as a session that just started.
@@ -256,7 +259,7 @@ async def _shot_shell(wd: Path) -> None:
 
 async def _shot_list(wd: Path, name: str, command: str) -> None:
     """A transcript-only shot: the /model or /mode listing."""
-    app = LanthornApp(_cfg(wd, boot_rain=False, theme="green"))
+    app = LanthornApp(_cfg(wd, boot_rain=False, theme="plain"))
     app.agent = _stub(wd)
     async with app.run_test(size=LIST_SIZE) as pilot:
         app.pop_screen()

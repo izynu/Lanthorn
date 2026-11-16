@@ -488,13 +488,13 @@ class Config:
     max_rounds: int = 400
     bash_timeout: int = 120
     max_output_chars: int = 20_000
-    theme: str = "green"
-    # Rain is decorative. By default the boot screen shows it (nothing to read
-    # there yet) and the shell does not, so the transcript stays legible.
-    # `/rain` or `--rain` turns it on in the shell; `--no-rain` turns it off
-    # everywhere, including the boot screen.
+    theme: str = "plain"
+    # Rain is decorative and off everywhere by default: the shell opens as a
+    # plain terminal, with nothing moving that is not an answer. `/rain` or
+    # `--rain` turns it on in the shell; `--no-rain` turns it off everywhere,
+    # including the boot screen, for an operator whose config has it on.
     rain: bool = False
-    boot_rain: bool = True
+    boot_rain: bool = False
     # Show the model's own reasoning when the endpoint forwards it, which only
     # some do — an Anthropic-native endpoint sends `thinking` blocks, while
     # LiteLLM's Anthropic bridge drops reasoning entirely. On by default

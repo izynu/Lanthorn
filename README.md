@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/hero.svg" alt="LANTHORN" width="820">
+<img src="docs/hero.svg" alt="Lanthorn" width="820">
 
 **An autonomous coding agent that lives in your terminal.**
 
@@ -9,14 +9,14 @@ keeps going until the job is done — while you watch it work.
 
 <sub>by **Mr-Destroyer**</sub>
 
-![python](https://img.shields.io/badge/python-3.11%2B-00ff41?style=flat-square&labelColor=040704)
-![platform](https://img.shields.io/badge/platform-linux%20%7C%20macos-00ff41?style=flat-square&labelColor=040704)
-![interface](https://img.shields.io/badge/interface-terminal-00ff41?style=flat-square&labelColor=040704)
-![status](https://img.shields.io/badge/status-active-00ff41?style=flat-square&labelColor=040704)
+![python](https://img.shields.io/badge/python-3.11%2B-d4d4d4?style=flat-square&labelColor=000000)
+![platform](https://img.shields.io/badge/platform-linux%20%7C%20macos-d4d4d4?style=flat-square&labelColor=000000)
+![interface](https://img.shields.io/badge/interface-terminal-d4d4d4?style=flat-square&labelColor=000000)
+![status](https://img.shields.io/badge/status-active-d4d4d4?style=flat-square&labelColor=000000)
 
 </div>
 
-<img src="docs/terminal.svg" alt="a LANTHORN session" width="900">
+<img src="docs/terminal.svg" alt="a Lanthorn session" width="900">
 
 ---
 
@@ -26,18 +26,20 @@ keeps going until the job is done — while you watch it work.
 
 ### Cold start
 
-<img src="docs/screenshots/01-boot.png" alt="LANTHORN boot screen — ASCII banner, system check, shell ready" width="880">
+<img src="docs/screenshots/01-boot.png" alt="Lanthorn boot screen — mark, system check, shell ready" width="880">
 
-*Banner reveal, a live system check, then the shell takes over.*
+*A short boot, then the shell takes over.*
 
 ### The shell
 
-<img src="docs/screenshots/02-shell.png" alt="the LANTHORN shell — loop rail, transcript with a live tool card, telemetry rail, status bar" width="880">
+<img src="docs/screenshots/02-shell.png" alt="the Lanthorn shell — transcript with a live tool card, prompt, footer" width="880">
 
-*A transcript that streams, a tool card that shows the call while it runs,
-and two rails that keep the loop and the cost in view. The left rail is the
-agent's state — think, call, observe, idle. The right rail is the bill:
-throughput, how full the context is, what it has cost, which files it touched.*
+*A transcript that streams and a tool card that shows the call while it runs.
+The default view is plain: the session at the top, the work in the middle, the
+prompt and two grey footer lines at the bottom. The rails that keep the loop
+and the cost in view are one keystroke away (`ctrl+t`): the left one is the
+agent's state — think, call, observe, idle — and the right one is the bill:
+throughput, context, cost, which files it touched.*
 
 <table>
 <tr>
@@ -66,7 +68,7 @@ throughput, how full the context is, what it has cost, which files it touched.*
 
 ## What it does
 
-LANTHORN is a coding agent you drive from a terminal. You describe what you
+Lanthorn is a coding agent you drive from a terminal. You describe what you
 want; it works out the steps, does them, and shows you everything it did.
 
 - **Talks, then acts.** Ask a question and it answers. Ask for a change and it
@@ -86,14 +88,16 @@ want; it works out the steps, does them, and shows you everything it did.
   theme tool output uses. It streams that way too, so a half-arrived answer
   reads as prose rather than as markup.
 - **Keeps score.** Live token counts and a running cost estimate, per turn and
-  per session.
+  per session, in the telemetry rail and `/cost`.
 - **Answers to a dial.** A mode switch decides whether it merely investigates,
   edits freely, or runs everything unattended.
 - **Stays in bounds.** An optional scope file declares what it may touch, and a
   second declares what it must never go near.
 - **Remembers the session.** Save it, load it, compact it when the context
   gets heavy.
-- **Looks the part.** A green-on-black terminal, animated from boot to prompt.
+- **Looks the part.** Plain by default — one foreground colour, one grey, and
+  colour only where it means something. Three neon palettes and a terminal-
+  matching `system` theme are a `/theme` away.
 
 ---
 
@@ -134,8 +138,8 @@ macOS ships Python 3.9 with the Xcode command-line tools, and Lanthorn needs
 shell is zsh, so when `~/.local/bin` is missing from `PATH` the installer prints
 the `~/.zshrc` line, not a `~/.bashrc` one.
 
-`Terminal.app` works, but it has no 24-bit colour; for the intended
-green-on-black look use iTerm2, Ghostty, WezTerm or kitty. The default route is
+`Terminal.app` works, but it has no 24-bit colour; for the intended plain
+look, and for the neon palettes, use iTerm2, Ghostty, WezTerm or kitty. The default route is
 a direct HTTPS connection to Logfare, so there is no local port to allow.
 
 `/source-iteracompute` and `/source-infronai` still have optional local proxies, and
@@ -330,7 +334,7 @@ will restart the checkout under you on the next launch.
 --deny PATH          hosts that are never touched
 --agents PATH        the doctrine file `auto-run` mode follows (default: workdir,
                      its parent, ~/.lanthorn, then ~)
---theme {green,amber,cyan,system}
+--theme {plain,green,amber,cyan,system}   (default: plain)
 --rain               start with matrix rain on
 --no-rain            no rain anywhere
 --no-think           never show the model's own reasoning
@@ -1680,7 +1684,7 @@ startup and then ignored. Rename it to `allow.yaml` or `out-of-scope.yaml`.
 | `/model [name]` | show or switch the model |
 | `/cost` | session token + cost breakdown |
 | `/scope` | scope status and entries |
-| `/theme green\|amber\|cyan\|system` | switch palette — `system` adopts the terminal's own colours |
+| `/theme plain\|green\|amber\|cyan\|system` | switch palette — `plain` is the default; `system` adopts the terminal's own colours |
 | `/rain` | toggle the matrix rain |
 | `/think` | show the model's own reasoning — where the endpoint forwards it |
 | `/effort [low\|medium\|high\|off]` | how hard the model thinks — `reasoning_effort`, or a thinking budget, per protocol |
@@ -2854,7 +2858,7 @@ lanthorn/                     the package
   payload.py                  /payload — the extension table, the argv, the build, the handler
   opencode.py                 /source-opencode — the proxy pool, rotation, and the launch
   update.py                   launch-time check for new commits
-  theme.py                    green / amber / cyan / system palettes, and the
+  theme.py                    plain / green / amber / cyan / system palettes, and the
                               remembered choice ($LANTHORN_HOME/current-theme)
   termbg.py                   asks the terminal for its own background
   termcolors.py               ...and for its foreground and 16 ANSI slots

@@ -455,56 +455,32 @@ def test_splash_banner() -> None:
     from rich.align import Align
     from rich.console import Console
 
-    from lanthorn.ui.banner import EMBLEM, splash_mark
+    from lanthorn.ui.banner import splash_mark
     from lanthorn.theme import get_palette
 
     p = get_palette("green", None)
     mark = splash_mark(p, model="deepseek-v4.1-flash",
-                       base_url="http://localhost:4001")
+                       base_url="http://localhost:4001", version="1.0.0")
     text = mark.plain
-    check("splash: the mark carries the name", "LANTHORN" in text)
+    check("splash: the mark carries the name", "Lanthorn" in text)
+    check("splash: the mark carries the version", "1.0.0" in text)
     check("splash: the mark carries the model", "deepseek-v4.1-flash" in text)
-    check("splash: the mark carries the endpoint", "localhost:4001" in text)
-    check("splash: the mark is four rows", len(text.split("\n")) == len(EMBLEM),
-          str(len(text.split("\n"))))
+    # Small by design: the session's facts, and nothing else. The endpoint is
+    # in the footer and in `/cost`; the header is four short lines.
+    rows = text.splitlines()
+    check("splash: the mark is a short block", len(rows) <= 5, str(len(rows)))
+    check("splash: every line starts at the left margin",
+          all(not row.startswith(" ") for row in rows), repr(text))
 
     def render(width: int) -> list[str]:
         c = Console(width=width, record=True, force_terminal=False)
-        c.print(Align.center(mark))
-        return c.export_text().rstrip("\n").split("\n")
+        c.print(mark)
+        return c.export_text().rstrip().splitlines()
 
-    # At every width, the emblem column starts at the same place on every row —
-    # that is what "the mark is not sheared" means, and a per-line indent gets
-    # this wrong the moment one row is wider than the others.
-    for width in (120, 100, 80, 70):
+    for width in (120, 80, 40):
         rows = render(width)
-        check(f"splash: every row is the full pane width at {width}",
-              {len(r) for r in rows} == {width}, str(sorted({len(r) for r in rows})))
-        # The emblem's own first column: the row with the widest glyph starts
-        # leftmost, and the ▀ row is indented by one. So the emblem's left edge
-        # is where the widest row begins, and no row may begin further left.
-        starts = [len(r) - len(r.lstrip()) for r in rows if r.strip()]
-        check(f"splash: the emblem is not sheared at {width}",
-              max(starts) - min(starts) <= 1, str(starts))
-
-    # The point of the whole change: the same renderable re-centres itself, so
-    # the banner is centred at a width it was never rendered at before.
-    wide = render(120)[0]
-    narrow = render(70)[0]
-    check("splash: the banner re-centres for a new width",
-          len(narrow) - len(narrow.lstrip()) < len(wide) - len(wide.lstrip()),
-          f"wide indent={len(wide) - len(wide.lstrip())} "
-          f"narrow indent={len(narrow) - len(narrow.lstrip())}")
-
-    # And it is actually centred, not merely re-indented: the left and right
-    # margins of the widest row agree to within the odd/even rounding.
-    for width in (120, 101, 80, 71):
-        rows = render(width)
-        row = max(rows, key=lambda r: len(r.rstrip()))
-        left = len(row) - len(row.lstrip())
-        right = len(row) - len(row.rstrip())
-        check(f"splash: the banner is centred at {width}",
-              abs(left - right) <= 1, f"left={left} right={right}")
+        check(f"splash: every row fits the pane at {width}",
+              all(len(r) <= width for r in rows), str([len(r) for r in rows]))
 
 
 def test_planning_state() -> None:

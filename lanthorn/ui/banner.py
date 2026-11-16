@@ -154,11 +154,15 @@ def banner_width(spacing: int = 1) -> int:
 #: FONT: the 5x6 block font has no concept of them, so there is nothing to
 #: reuse. It is a rounded block, the shape a terminal can actually hold —
 #: a circular logo would need far more rows to read as one.
+#: The transcript's mark: a simple chevron, drawn the way the shell's own
+#: punctuation is. It replaced a filled block emblem — the splash is a heading
+#: for the session, not a logo plate, and four rows of solid fill read louder
+#: than anything it introduces.
 EMBLEM: list[str] = [
-    " ▄███▄ ",
-    "███████",
-    "███████",
-    " ▀███▀ ",
+    "  ╱╲  ",
+    " ╱  ╲ ",
+    "╲    ╱",
+    " ╲  ╱ ",
 ]
 
 EMBLEM_GAP = "  "
@@ -259,30 +263,36 @@ def spin_frame_index(elapsed: float) -> int:
     return int(elapsed / SPIN_STEP) % SPIN_FRAMES
 
 
-def splash_mark(palette: Palette, model: str = "", base_url: str = "") -> Text:
-    """The splash banner: emblem and name side by side, as one renderable.
+def splash_mark(palette: Palette, model: str = "", base_url: str = "",
+                effort: str = "", cwd: str = "", version: str = "",
+                billing: str = "") -> Text:
+    """The session header: the name and the session's facts, a few short lines.
 
-    Returned as a single ``Text`` rather than a list of lines so the caller can
-    hand it to ``Align.center`` — which is what centres it, and re-centres it
-    every time the transcript reflows to a new width. Centring this by padding
-    the strings instead would look right at launch and drift off-centre the
-    first time a rail was dragged, which is the fault this replaces.
+    Small on purpose. It sits at the top of an otherwise empty screen, which
+    is the whole look the operator asked for — the shell, not a dashboard —
+    and the four facts a session has (what it is, what it is pointed at,
+    where it runs, what to type) are all it needs to say. The footer under
+    the prompt carries the same facts live; this is the note you read once
+    at the start, so it can be quiet.
 
-    The lower rows carry the model and the endpoint, so the banner is the one
-    place that says what this session is actually pointed at.
+    Returned as a single ``Text`` rather than a list of lines so the caller
+    can reflow it as one block when the transcript changes width. It is
+    written at the left margin, like every other line in the transcript.
     """
-    right = [
-        ("LANTHORN", f"bold {palette.accent}"),
-        (banner_subtitle(), palette.primary),
-        (model, palette.dim),
-        ("type /help for commands" + (f"   ·   {base_url}" if base_url else ""),
-         palette.dim),
+    pointed = model + (f" with {effort} effort" if effort and model else effort)
+    t = Text(no_wrap=True)
+    t.append("✳ ", style=palette.dim)
+    t.append("Lanthorn", style=f"bold {palette.primary}")
+    if version:
+        t.append(f" v{version}", style=palette.dim)
+    rows = [
+        (pointed or banner_subtitle(), palette.primary),
+        (cwd, palette.dim),
+        ("type /help for commands", palette.dim),
     ]
-    width = max(len(row) for row in EMBLEM)
-    t = Text()
-    for i, row in enumerate(EMBLEM):
-        t.append(row.ljust(width) + EMBLEM_GAP, style=f"bold {palette.accent}")
-        t.append(*right[i])
-        if i < len(EMBLEM) - 1:
-            t.append("\n")
+    for text, style in rows:
+        if not text:
+            continue
+        t.append("\n")
+        t.append(text, style=style)
     return t

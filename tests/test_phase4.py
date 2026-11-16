@@ -1006,7 +1006,9 @@ async def test_ui_rails(wd: Path) -> None:
     from lanthorn.ui.palette_cmd import CommandPalette, PaletteEntry, fuzzy, rank
     from lanthorn.ui.rails import (CallStrip, ContextGauge, FileRiver, LoopRail,
                                    TelemetryRail, Waveform)
-    from lanthorn.ui.widgets import ChatPane, HeaderBar
+    from lanthorn.ui.widgets import ChatPane, StatusBar
+
+    NL = chr(10)
 
     # ---- fuzzy matching (pure, no app needed) -----------------------------
     check("fuzzy: subsequence matches", fuzzy("md", "/model") is not None)
@@ -1031,11 +1033,22 @@ async def test_ui_rails(wd: Path) -> None:
         app.query_one("#input").focus()
         await pilot.pause()
 
-        # ---- the three rails are mounted and visible ----------------------
+        # ---- the shell opens without the rails ---------------------------
+        # The transcript, the prompt and the footer are the default screen;
+        # the rails are a display the operator asks for.
         loop = app.query_one(LoopRail)
         tele = app.query_one(TelemetryRail)
-        check("rails: loop rail mounted", loop.display and loop.region.width > 0)
-        check("rails: telemetry rail mounted", tele.display and tele.region.width > 0)
+        check("shell: the rails start away", not loop.display and not tele.display,
+              f"loop={loop.display} tele={tele.display}")
+        check("shell: the transcript starts visible",
+              app.query_one(ChatPane).display)
+
+        # ---- Ctrl+T brings the rails in, and takes them away --------------
+        await pilot.press("ctrl+t")
+        await pilot.pause()
+        check("rails: Ctrl+T shows the loop rail", loop.display and loop.region.width > 0)
+        check("rails: Ctrl+T shows the telemetry rail",
+              tele.display and tele.region.width > 0)
         check("rails: loop starts idle", loop.stage == "idle")
 
         # ---- a turn drives the whole loop --------------------------------
@@ -1124,6 +1137,23 @@ async def test_ui_rails(wd: Path) -> None:
               "tok/s" in str(wave.render()) and "180.0" in str(wave.render()),
               str(wave.render()).replace("\n", " | "))
 
+        # ---- the footer says what this session is ------------------------
+        bar = app.query_one(StatusBar)
+        rows = str(bar.render()).split(NL)
+        check("footer: two rows", len(rows) == 2, str(len(rows)))
+        check("footer: the model is on the first row",
+              app.cfg.display_model in rows[0], rows[0])
+        check("footer: the mode is on the first row", "auto" in rows[0], rows[0])
+        check("footer: the mode line names the mode",
+              "auto mode" in rows[1], rows[1])
+        check("footer: the token and cost counters are gone",
+              "tok " not in rows[0] and "$ " not in rows[0], rows[0])
+
+        # ---- no title row: the splash names the session ------------------
+        check("title: no window title row above the transcript",
+              not any(type(w).__name__ == "TitleLine" for w in app.screen.walk_children()),
+              "a TitleLine is still mounted")
+
         # ---- narrow terminals drop the rails ------------------------------
         await pilot.resize_terminal(92, 34)
         await pilot.pause()
@@ -1133,42 +1163,32 @@ async def test_ui_rails(wd: Path) -> None:
         check("narrow: the telemetry rail is hidden", not tele.display)
         check("narrow: the transcript is still visible",
               app.query_one(ChatPane).display)
-
-        # The header sheds cosmetics before facts: the scope status and the
-        # sandbox indicator must survive a narrow bar even though the cwd and
-        # theme do not. It is measured against the row width, not a fixed
-        # threshold, so a long cwd sheds itself rather than silently eating
-        # the scope status.
-        header = app.query_one(HeaderBar)
-        htxt = str(header.render())
-        check("narrow: the scope status survives", "scope" in htxt, htxt)
-        check("narrow: the sandbox indicator survives", "sandbox" in htxt, htxt)
-        check("narrow: the theme is shed", "theme:" not in htxt, htxt)
-        check("narrow: the header still fits its row",
-              Text(htxt).cell_len <= header.size.width,
-              f"{Text(htxt).cell_len} > {header.size.width}")
+        # The footer sheds the directory before the mode: a long cwd must
+        # never push off the one field that says what tools may run.
+        nrows = str(bar.render()).split(NL)
+        check("narrow: the mode survives", "auto" in nrows[0], nrows[0])
+        check("narrow: the footer still fits its row",
+              all(Text(r).cell_len <= bar.size.width for r in nrows),
+              f"{[Text(r).cell_len for r in nrows]} > {bar.size.width}")
 
         await pilot.resize_terminal(140, 34)
         await pilot.pause()
         check("wide: the rails come back", loop.display and tele.display)
-        # At a wide row the theme badge is back. The cwd is not asserted at
-        # 140 columns: the sandbox and scope facts are kept before it and a
-        # real Windows temp path is long enough that both cannot fit, which is
-        # the shedding working as designed, not a regression.
-        check("wide: the theme returns", "theme:" in str(header.render()),
-              str(header.render()))
-        check("wide: the sandbox survives",
-              "sandbox" in str(header.render()), str(header.render()))
 
-        # A cwd long enough to overflow must shed *itself*, never the scope.
-        header.cwd = "~/" + "very-long-project-name/" * 4
-        header.refresh_content()
+        # A cwd long enough to overflow must shed *itself*, never the mode.
+        bar.cwd = "~/" + "very-long-project-name/" * 4
+        bar.render_bar()
         await pilot.pause()
-        htxt = str(header.render())
-        check("wide: an over-long cwd does not push the scope off",
-              "scope" in htxt and "sandbox" in htxt
-              and Text(htxt).cell_len <= header.size.width,
-              f"{Text(htxt).cell_len} > {header.size.width}")
+        wrows = str(bar.render()).split(NL)
+        check("wide: an over-long cwd does not push the mode off",
+              "auto" in wrows[0]
+              and all(Text(r).cell_len <= bar.size.width for r in wrows),
+              wrows[0])
+
+        # ---- Ctrl+T again puts the rails away ----------------------------
+        await pilot.press("ctrl+t")
+        await pilot.pause()
+        check("rails: Ctrl+T hides them again", not loop.display and not tele.display)
 
 
 async def test_termbg(wd: Path) -> None:
@@ -1265,7 +1285,7 @@ async def test_system_theme(wd: Path) -> None:
 
     from lanthorn import theme as theme_mod
     from lanthorn.termcolors import detect_colors, parse_colors
-    from lanthorn.theme import (PALETTES, SYSTEM_THEME, THEME_NAMES,
+    from lanthorn.theme import (DEFAULT_THEME, PALETTES, SYSTEM_THEME, THEME_NAMES,
                                 get_palette, system_palette)
 
     # ---- parsing: one batched reply carries every answer -------------------
@@ -1385,18 +1405,18 @@ async def test_system_theme(wd: Path) -> None:
           pal.glow == pal.primary)
 
     # A partial reply degrades field by field, not all at once: no ANSI slots
-    # answered here, so every role falls through to green's value while the
-    # background — the one thing that *was* reported — is still adopted.
+    # answered here, so every role falls through to the default palette's value
+    # while the background — the one thing that *was* reported — is adopted.
     pp = system_palette(parse_colors(b"\x1b]11;rgb:1010/1313/1515\x1b\\"))
-    check("theme: a missing ANSI slot falls back to green's value",
+    check("theme: a missing ANSI slot falls back to the default palette's value",
           (pp.dim, pp.accent, pp.red, pp.amber)
-          == (PALETTES["green"].dim, PALETTES["green"].accent,
-              PALETTES["green"].red, PALETTES["green"].amber),
+          == (PALETTES[DEFAULT_THEME].dim, PALETTES[DEFAULT_THEME].accent,
+              PALETTES[DEFAULT_THEME].red, PALETTES[DEFAULT_THEME].amber),
           f"{pp.dim} {pp.accent} {pp.red} {pp.amber}")
     check("theme: a partially-answered terminal still gets its background",
           pp.bg == "#101315", pp.bg)
-    check("theme: no colours at all gives exactly the green palette",
-          system_palette(None) == PALETTES["green"])
+    check("theme: no colours at all gives exactly the default palette",
+          system_palette(None) == PALETTES[DEFAULT_THEME])
 
     # ---- the light rule (the operator's decision) --------------------------
     # The three fixed palettes refuse a light background — neon on white is
@@ -1415,7 +1435,8 @@ async def test_system_theme(wd: Path) -> None:
     check("theme: every name in THEME_NAMES resolves to a palette",
           all(get_palette(n).name for n in THEME_NAMES), str(THEME_NAMES))
     check("theme: system is offered alongside the three fixed ones",
-          THEME_NAMES == ["green", "amber", "cyan", "system"], str(THEME_NAMES))
+          THEME_NAMES == ["plain", "green", "amber", "cyan", "system"],
+          str(THEME_NAMES))
 
     # ---- persistence: the choice survives a restart ------------------------
     with tempfile.TemporaryDirectory() as td:
@@ -1483,8 +1504,8 @@ async def test_system_theme(wd: Path) -> None:
                 main_mod.main([*argv, "--workdir", str(wd)])
                 return seen[-1]
 
-            check("theme: a fresh launch opens on green",
-                  launched() == "green", launched())
+            check("theme: a fresh launch opens plain",
+                  launched() == DEFAULT_THEME, launched())
             theme_mod.set_current_theme("amber")
             check("theme: a remembered theme comes back on the next launch",
                   launched() == "amber", launched())
@@ -1504,8 +1525,8 @@ async def test_system_theme(wd: Path) -> None:
             # A name left by another build falls through to green rather than
             # being handed to get_palette, which has no palette for it.
             (home / "current-theme").write_text("vaporwave\n")
-            check("theme: a stale name falls through to green",
-                  launched() == "green", launched())
+            check("theme: a stale name falls through to the default",
+                  launched() == DEFAULT_THEME, launched())
 
     # ---- and it reaches the app --------------------------------------------
     with tempfile.TemporaryDirectory() as td:
@@ -1566,8 +1587,8 @@ async def test_system_theme(wd: Path) -> None:
                     " ".join(s.text for s in blind.query_one("#transcript").lines).split())
                 check("theme: a terminal that reports nothing says so",
                       "did not report its colours" in blob, blob[-90:])
-                check("theme: and falls back to the green palette",
-                      blind.palette == PALETTES["green"], blind.palette.bg)
+                check("theme: and falls back to the default palette",
+                      blind.palette == PALETTES[DEFAULT_THEME], blind.palette.bg)
 
 
 async def test_theme_survives_exit(wd: Path) -> None:
@@ -2153,10 +2174,13 @@ async def test_copy_on_select(wd: Path) -> None:
         app._copy_selection("hello from lanthorn")
         check("copy: _copy_selection hits the clipboard",
               copied == ["hello from lanthorn"], str(copied))
-        check("copy: status bar reports the copy",
-              app.query_one(StatusBar).activity
-              == f"copied {len('hello from lanthorn')} chars",
-              app.query_one(StatusBar).activity)
+        # The copy is acknowledged in the footer's second row for a few
+        # seconds, then the idle readout returns — a momentary note, not a
+        # lasting change to what the bar calls the activity.
+        check("copy: the footer reports the copy",
+              f"copied {len('hello from lanthorn')} chars"
+              in str(app.query_one(StatusBar).render()),
+              str(app.query_one(StatusBar).render()))
 
         copied.clear()
         app._copy_selection("   \n")
@@ -2400,6 +2424,10 @@ async def test_harness_copy_resize_mouse(wd: Path) -> None:
         await pilot.pause()
 
         # ---- the rails resize with the mouse --------------------------------
+        # They open with the shell now, so the drag test asks for them first.
+        if not loop.display:
+            await pilot.press("ctrl+t")
+            await pilot.pause()
         start = loop.region.width
         copied.clear()
         await pilot.mouse_down(loop, (start - 1, 3))

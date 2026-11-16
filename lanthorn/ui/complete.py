@@ -331,8 +331,11 @@ class CompletionPopup(VerticalScroll):
         display: none;
         height: auto;
         max-height: 10;
+        /* The input spans the width, so the popup does too: the list reads as
+           coming out of the field above it. Borderless, because the input's
+           frame is the only one on the screen. */
+        border: none;
         margin: 0 1;
-        border: round $secondary;
         background: $background;
         padding: 0 1;
         scrollbar-size-vertical: 1;

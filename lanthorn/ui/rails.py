@@ -2,7 +2,7 @@
 
 These sit either side of the transcript and are the difference between a log
 viewer and an instrument panel. Both are plain ``Static`` widgets that
-``update()`` a Rich ``Text`` — the same pattern ``HeaderBar``/``StatusBar``
+``update()`` a Rich ``Text`` — the same pattern ``StatusBar``
 already use in ``widgets.py`` — so they add no rendering machinery.
 
 Deliberately *not* rain-aware: ``RainRichLog`` paints rain inside its own blank

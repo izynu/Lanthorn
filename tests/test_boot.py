@@ -87,8 +87,8 @@ def test_lands_on_static_mark() -> None:
 
     # The specific snap that was fixed: a flat cap at full width.
     full = spin_frame(0)
-    check("the full-width frame keeps its rounded cap, not a flat one",
-          "▄███▄" in full[0] and "▀███▀" in full[-1],
+    check("the full-width frame is the emblem, not a flat cap",
+          full[0] == EMBLEM[0] and full[-1] == EMBLEM[-1],
           f"top={full[0]!r}")
 
 
@@ -184,7 +184,7 @@ def test_shading_is_monotone() -> None:
 
     full = [i for i in range(SPIN_FRAMES) if _width(spin_frame(i)) == EMBLEM_WIDTH]
     check("the lit glyph is reserved for the widest frames",
-          all(spin_frame(i)[1].strip()[0] == "█" for i in full), str(full))
+          full == [0, SPIN_FRAMES // 2], str(full))
 
 
 # ---------------------------------------------------------------------------
@@ -343,8 +343,8 @@ def test_wiring_styles_the_frame_as_a_unit() -> None:
     def styles():
         return {str(s.style) for s in caps["#boot-emblem"].last.spans}
 
-    check("the upright frame is styled bold accent",
-          styles() == {"bold #00ffaa"}, str(styles()))
+    check("the upright frame is styled accent",
+          styles() == {f"bold {get_palette('green').accent}"}, str(styles()))
 
     edge_at = SPIN_FRAMES // 4
     while bs._spin_index() != edge_at and bs._phase == "banner":
@@ -366,7 +366,7 @@ def test_wiring_styles_the_frame_as_a_unit() -> None:
         bs._tick()
     check("the far side is full width and lit again",
           _width([r for r in caps["#boot-emblem"].last.plain.split("\n")]) == EMBLEM_WIDTH
-          and styles() == {"bold #00ffaa"},
+          and styles() == {f"bold {get_palette('green').accent}"},
           str(styles()))
 
 

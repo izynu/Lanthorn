@@ -48,8 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="DEPRECATED — replaced by --allow / --deny; ignored with a warning")
     parser.add_argument("--unsafe", action="store_true",
                         help="disable the filesystem sandbox (paths may escape the workdir)")
-    parser.add_argument("--theme", default=None, choices=THEME_NAMES,
-                        help="colour theme (system = match the terminal's own colours)")
+    parser.add_argument("--theme", default=None, choices=[*THEME_NAMES, "default"],
+                        help="colour theme (default = the plain shell; "
+                             "system = match the terminal's own colours)")
     parser.add_argument("--rain", action="store_true",
                         help="start with matrix rain on in the shell (off by default for readability)")
     parser.add_argument("--no-rain", action="store_true",
@@ -225,10 +226,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # Which theme to open with. An explicit --theme wins; failing that, whatever
     # was last chosen with /theme, so a restart lands back on it; failing both,
-    # the config default (green). ``from_env`` ignores None overrides, so
+    # the config default (plain). ``from_env`` ignores None overrides, so
     # resolving the precedence into one value here is what makes the remembered
     # choice take effect — and what keeps ``--theme`` authoritative over it.
-    theme = args.theme or current_theme()
+    # ``/theme default`` clears the memory, so a colour chosen once can be
+    # dropped without guessing which name the plain shell is.
+    remembered = current_theme()
+    theme = args.theme or (None if remembered == "default" else remembered)
 
     # Shell rain is off unless requested. --no-rain kills rain everywhere,
     # including the boot screen.
