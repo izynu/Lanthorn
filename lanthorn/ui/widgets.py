@@ -801,16 +801,23 @@ class HeaderBar(Static):
             right.append("◉ ", style=f"bold {p.red}")
             right.append(self.state_note or "Error", style=f"bold {p.red}")
         else:
-            right.append("◉ ", style=f"bold {p.accent}")
-            word = self.state_note or "Ready"
-            # The ready pill: the word on a lifted background, so the right
-            # edge of the header reads as a state rather than as more text.
-            # Inverted text, not a painted background: the screen's own
-            # background is the theme's, and the terminal-background test
-            # requires every cell to keep it.
-            right.append(f" {word} ", style=f"bold reverse {p.primary}")
+            # Ready state as a filled rounded pill: green-ish text on a
+            # lifted dark background. The pill is built from text segments
+            # with bgcolor extending one cell past the text on each side.
+            from rich.color import Color as RichColor
+            lifted = p.bg
+            # Lift the background slightly (same approach as PromptInput sheen)
+            try:
+                r, g, b = lifted.red, lifted.green, lifted.blue
+                lift = tuple(min(255, c + 14) for c in (r, g, b))
+                lifted = RichColor.from_rgb(*lift)
+            except Exception:
+                pass
+            right.append(" ", style=f"on {lifted}")
+            right.append("◉ Ready", style=f"bold {p.accent} on {lifted}")
+            right.append(" ", style=f"on {lifted}")
 
-        sep = "  │  "
+        sep = "   │   "
         gap = "   "
         row = Text(no_wrap=True)
         row.append_text(left)
@@ -883,7 +890,7 @@ class StatusBar(Static):
 
     DEFAULT_CSS = """
     StatusBar {
-        height: 2;
+        height: 1;
         padding: 0 1;
         background: $background;
     }
@@ -1062,96 +1069,95 @@ class StatusBar(Static):
         sep = ("  │  ", p.dim)
         label = str(m.get("label", self.mode.upper())).lower()
 
-        # ---- row one: what is happening, then the mode -------------------
-        # The readout comes first and the mode second: the moving thing sits
-        # at a fixed column instead of being pushed around by the length of
-        # the mode's label.
+        # ---- single footer row per reference -----------------------------------
+        # Order: model (◇) → activity (● Idle) → mode (⚡ Auto Mode) → scope (◎ Scope: Off)
+        # then right-aligned shortcuts: /help │ /models │ /tools
         line = Text(no_wrap=True)
+
+        # 1. Model with diamond glyph
+        line.append("◇ ", style=p.dim)
+        line.append(self.model, style=p.primary)
+        line.append(*sep)
+
+        # 2. Activity: ● Idle / spinner Working
         if self._note:
             line.append(self._note, style=p.primary)
         elif self.hold:
-            # Compaction: the bar carries its own spinner frame, advanced by the
-            # animation timer, so the readout moves at the same rate as the
-            # panel instead of the slower verb rotation.
             from .renderers import COMPACT_SPINNER
             spin = COMPACT_SPINNER[self._compact_frame % len(COMPACT_SPINNER)]
             line.append(f"{spin} {self.activity}", style=p.primary)
         elif self.busy:
             from .renderers import SPINNER_FRAMES
             spin = SPINNER_FRAMES[self._spin_frame % len(SPINNER_FRAMES)]
-            # The working readout is the second thing allowed to move: a
-            # spinner alone reads as a frozen frame at a glance, and the sweep
-            # is what says "the model is still writing".
             lit = f"{spin} {self.activity}"
             line.append_text(gradient.paint(
                 lit, gradient.LIVE_GRADIENT,
                 phase=(self._spin_frame * 0.13) % 1.0,
                 period=max(10, len(lit))))
         else:
-            # The reference footer's idle word: ``● Idle``, not ``● idle``.
+            # Idle state: ● Idle (capitalized)
             line.append(f"● {self.activity[:1].upper()}{self.activity[1:]}", style=p.dim)
         line.append(*sep)
-        # What the shell is: the model it will call. It changes with /model, so
-        # it belongs beside the mode rather than in the header alone.
-        line.append("◇ ", style=p.dim)
-        line.append(self.model, style=p.primary)
-        line.append(*sep)
+
+        # 3. Mode: ⚡ Auto Mode (Title Case with icon for special modes)
         line.append_text(self.mode_text(label))
         line.append(*sep)
-        # Scope is a guard, and the footer states it every frame: on is a quiet
-        # check, off is a red word, because a shell with no scope is the one
-        # fact the operator must never have to go looking for.
-        if self.unsafe:
-            line.append("sandbox off", style=f"bold {p.red}")
-        elif self.scope_ok:
-            line.append("◎ scope on", style=p.dim)
-        else:
-            line.append(f"◎ scope {self.scope_text or 'off'}", style=f"bold {p.red}")
 
-        # ---- row two: the shortcuts, right-aligned ------------------------
+        # 4. Scope: ◎ Scope: On/Off (capitalized with colon)
+        if self.unsafe:
+            line.append("◎ Sandbox: Off", style=f"bold {p.red}")
+        elif self.scope_ok:
+            line.append("◎ Scope: On", style=p.dim)
+        else:
+            line.append(f"◎ Scope: {self.scope_text or 'Off'.capitalize()}", style=f"bold {p.red}")
+
+        # Right-aligned shortcuts on the SAME row
         keys = Text(no_wrap=True)
         for n, (key, what) in enumerate(self.SHORTCUTS):
             if n:
-                # A bar between the commands, not a pipe: the footer is a
-                # shell's status line, and the bar is what the header uses
-                # between its own fields.
                 keys.append("  │  ", style=p.dim)
             keys.append(key, style=p.primary)
         limit = self.size.width or 200
-        pad = max(0, limit - 2 - keys.cell_len)
-        second = Text(no_wrap=True)
-        second.append(" " * pad)
-        second.append_text(keys)
+        pad = max(0, limit - 2 - line.cell_len - keys.cell_len)
+        line.append(" " * pad)
+        line.append_text(keys)
 
-        t = Text(no_wrap=True)
-        t.append_text(line)
-        t.append(chr(10))
-        t.append_text(second)
-        return t
+        return line
 
     #: The footer's shortcut row. Plain text, no emoji: these are commands to
     #: type, and the footer is the last place to teach a key you did not bind.
+    #: Reference uses plural "/models".
     SHORTCUTS: tuple[tuple[str, str], ...] = (
         ("/help", "keys and commands"),
-        ("/model", "switch model"),
+        ("/models", "switch model"),
         ("/tools", "what it can do"),
     )
 
     def mode_text(self, label: str) -> Text:
-        """The mode label. A special mode is a gradient; the rest are plain.
+        """The mode label. A special mode is a gradient with ⚡ icon and Title Case.
 
         "auto" is the one mode that changes what the agent may do without
         asking, so it is the one that gets the sweep — a colour that means
         "this shell is running unattended". Every other mode is a word in the
         primary colour, and the gated ones keep their red safety badges where
         they are.
+
+        Reference design: "⚡ Auto Mode" with lightning icon and Title Case.
         """
         p = self.palette
-        text = f"{label} mode"
+        # Title Case for mode label per reference
+        title_label = label.title()
+        # Reference shows "Auto Mode" not "Auto mode"
+        if title_label.endswith(" Mode"):
+            text = f"⚡ {title_label}"
+        else:
+            text = f"⚡ {title_label} Mode"
         if self.mode in SPECIAL_MODES:
+            # Gradient paint includes the ⚡ icon
             return gradient.paint(text, gradient.AUTO_GRADIENT,
                                   phase=self._mode_phase,
                                   period=max(8, len(text)), style="bold")
+        # Non-special modes: plain with icon
         return Text(text, style=p.primary)
 
     def on_mount(self) -> None:

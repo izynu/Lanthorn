@@ -71,7 +71,19 @@ def hacker_syntax(code: str, lang: str, palette: Palette, *, line_numbers: bool 
 
 
 def _mono_theme(palette: Palette):
-    """A minimal green/amber monochrome pygments theme."""
+    """Reference-design pygments theme: keywords blue, strings green/amber,
+    class names amber, comments dim (not monochrome green).
+
+    Reference screenshot shows:
+    - Keywords (def, class, import, from, etc.) → blue
+    - Strings (single quotes) → green
+    - Strings (double quotes) → amber
+    - Class names → amber
+    - Comments → dim
+    - Name.Function → primary (warm white)
+    - Numbers → accent
+    - Operators → primary
+    """
     from pygments.style import Style as PygStyle
     from pygments.token import (
         Comment, Error, Generic, Keyword, Name, Number, Operator, String, Token,
@@ -80,19 +92,29 @@ def _mono_theme(palette: Palette):
     p, dim, accent, red, amber = (
         palette.primary, palette.dim, palette.accent, palette.red, palette.amber,
     )
+    # Blue for keywords - use palette.blue if available, otherwise a blue hex
+    blue = getattr(palette, 'blue', '#5ea1ff')
 
     class Mono(PygStyle):
         background_color = palette.bg
+        # Reference: single-quote strings → green (accent), double-quote → amber
+        # Keywords → blue, Class names → amber, Comments → dim
         styles = {
             Token: p,
             Comment: dim,
-            Keyword: f"bold {accent}",
+            Keyword: f"bold {blue}",          # blue keywords
             Operator: p,
             Name: p,
             Name.Builtin: accent,
-            Name.Function: f"bold {p}",
-            Name.Class: f"bold {accent}",
-            String: amber,
+            Name.Function: f"bold {p}",       # function names warm white
+            Name.Class: f"bold {amber}",      # class names amber
+            Name.Exception: f"bold {amber}",  # exception classes amber
+            Name.Decorator: accent,           # decorators accent
+            String: f"{palette.accent}",      # default strings → green
+            String.Single: f"{palette.accent}",  # single-quote strings → green
+            String.Double: f"{amber}",        # double-quote strings → amber
+            String.Affix: amber,              # f-string prefix amber
+            String.Interpol: p,               # f-string interpolation primary
             Number: accent,
             Generic: p,
             Generic.Deleted: red,
@@ -431,18 +453,70 @@ def _plain_of(body: RenderableType) -> Text:
         return Text()
 
 
-def _preview_of(body: RenderableType, lines: int) -> Text:
-    """The first *lines* lines of a body, as a Text.
+def _preview_of(body: RenderableType, lines: int) -> RenderableType:
+    """The first *lines* lines of a body.
 
-    A non-Text body (a Syntax, a Group) is previewed as plain text rather than
-    highlighted: the preview is a glance, and highlighting three lines costs a
-    pygments run per card for no reading benefit.
+    For code bodies (Syntax), return a trimmed Syntax to preserve highlighting
+    and line numbers. For other types, return plain Text preview.
     """
+    # If it's already a Syntax, slice its code and rebuild
+    code = getattr(body, "code", None)
+    if isinstance(code, str):
+        # Build a preview Syntax with the same settings
+        from rich.syntax import Syntax
+        preview_code = "\n".join(code.splitlines()[:lines])
+        # Get palette from body if available
+        palette = getattr(body, '_palette', None)
+        if palette is None:
+            # Fallback to a minimal palette-like object
+            from types import SimpleNamespace
+            palette = SimpleNamespace(
+                primary="#eaeaea", dim="#888888", accent="#a4c69b",
+                red="#ff6b6b", amber="#e5c07b", blue="#5ea1ff",
+                bg="#101315"
+            )
+        theme = _mono_theme(palette)
+        return Syntax(
+            preview_code,
+            body.lexer_name if hasattr(body, 'lexer_name') else "python",
+            theme=theme,
+            line_numbers=True,
+            word_wrap=True,
+            background_color=getattr(body, 'background_color', palette.bg),
+        )
+    # Fallback for Text and other renderables
     rows = _plain_of(body).plain.splitlines()
     if len(rows) <= lines:
         return Text(chr(10).join(rows))
     return Text(chr(10).join(rows[:lines]))
 
+
+
+def _lifted_bg(palette: Palette):
+    """Compute a slightly lifted background color for card panels."""
+    from rich.color import Color as RichColor
+    bg = palette.bg
+    try:
+        r, g, b = bg.red, bg.green, bg.blue
+        lift = tuple(min(255, c + 14) for c in (r, g, b))
+        return RichColor.from_rgb(*lift)
+    except Exception:
+        return palette.bg
+
+
+def _build_chip(text: str, palette: Palette) -> Text:
+    """Build a rounded-outline chip text for hints like [Show code ⌄].
+
+    Since Rich Text can't do inline rounded boxes, we simulate with
+    Unicode box-drawing chars and a border style.
+    """
+    t = Text(no_wrap=True)
+    # Use unicode rounded corners: ╭─╮ / ╰─╯ at inline scale
+    # Inner padding spaces for the chip look
+    t.append(" ", style=f"on {palette.dim}")
+    t.append(text, style=f"bold {palette.primary} on {palette.dim}")
+    t.append(" ", style=f"on {palette.dim}")
+    return t
 
 
 def tool_card(name: str, args: dict, palette: Palette, *,
@@ -453,34 +527,33 @@ def tool_card(name: str, args: dict, palette: Palette, *,
               tag: str = "", tag_color: str = "", verb: str = "",
               elapsed: float | None = None, hint_in_summary: bool = False,
               hint: str = "") -> Group:
-    """One tool call, as Claude Code draws it: a compact summary row, then the
-    body.
+    """One tool call, as the reference design draws it.
 
-    The shape, top to bottom::
+    Reference layout:
 
-        ● read_file(src/api/client.py)
-          Read 128 lines  ·  Show code
+        ⌄ ● Read(src/api/client.py)
+          └ Read 128 lines  ·  [Show code ⌄]     Preview (10/128)   Full (128)
 
-              1  from __future__ import annotations
-              2  import time
-              3  ...
-             … 125 more lines
+        ╭─────────────────────────────────────────────────────────╮
+        │  1  from __future__ import annotations                 │
+        │  2  import time                                        │
+        │  ...                                                   │
+        │  › Show 118 more lines...                              │
+        ╰─────────────────────────────────────────────────────────╯
 
-    * The first row is the call: a status glyph, the tool's verb in lower case,
-      and its argument in brackets. It is what the eye scans when it is looking
-      for "what did it do", so it carries no decoration.
-    * The second row is the result: a joint, what came back, and the hint that
-      opens the body. It is grey and indented, so the call reads as the heading
-      and the result as its caption.
-    * The body is a preview of ``preview_lines`` lines, then a dim "… N more
-      lines" row when the body is longer. A card is a summary of a call, not the
-      call's whole output.
+    Collapsed cards:
 
-    ``phase`` is the gradient ramp position while the tool is still running:
-    the verb and its argument sweep, which is what "this is happening now"
-    looks like in a transcript that is otherwise still. ``verb`` overrides the
-    tool name (an edit shows "update"); ``elapsed`` adds a running clock to the
-    summary row for a live card.
+        › ● Update(src/api/client.py)
+          └ Added 2 changes  ·  [Show diff ⌄]
+
+    Key differences from old:
+    - Expanded head gets leading chevron ⌄
+    - Collapsed head gets leading chevron ›
+    - Body panel: ROUNDED border with subtle lifted fill
+    - Preview/Full tabs on caption row (not more-lines row)
+    - Hint wrapped in chip style [Show code ⌄]
+    - More-lines row moved INSIDE panel bottom border
+    - Collapsed cards wrapped in rounded panel
     """
     shown = preview if preview is not None else (
         _preview_of(body, preview_lines) if body is not None else None)
@@ -488,7 +561,20 @@ def tool_card(name: str, args: dict, palette: Palette, *,
     kept = _body_lines(shown) if shown is not None else 0
 
     arg = detail or _detail(name, args)
+    # Detect collapsed state: has body but no preview (preview=None means collapsed)
+    is_collapsed = body is not None and preview is None and shown is None
+    # Also treat hint_in_summary cards as potentially collapsed when called from
+    # diff_panel / tool_result_panel
+
     head = Text()
+    # Chevron prefix per reference
+    if shown is not None:
+        # Expanded: ⌄ at start
+        head.append("⌄ ", style=palette.dim)
+    elif is_collapsed:
+        # Collapsed: › at left edge
+        head.append("› ", style=palette.dim)
+    # Status glyph
     if is_error:
         head.append("● ", style=f"bold {palette.red}")
     elif phase is not None:
@@ -505,65 +591,129 @@ def tool_card(name: str, args: dict, palette: Palette, *,
     else:
         head.append(label, style=f"bold {palette.primary}")
         head.append("(", style=palette.dim)
-        # The argument is the line's one piece of colour: it is what the call
-        # acts on, and in a column of cards it is the thing being scanned for.
-        head.append(arg, style=palette.accent)
+        head.append(arg, style=palette.dim)
         head.append(")", style=palette.dim)
 
-    # The caption hangs off the head's glyph, the way a tree's second line hangs
-    # off its first: ``└`` under the ``●``, then what came back.
+    # Caption row with chip-wrapped hint and Preview/Full tabs right-aligned
     caption = Text(no_wrap=True)
     caption.append("  └ ", style=palette.dim)
-    wrote = False
+
+    # Summary part
+    summary_text = ""
     if isinstance(summary, Text):
-        caption.append_text(summary)
-        wrote = True
+        summary_text = summary.plain
     elif summary:
-        caption.append(summary, style=f"bold {palette.red}" if is_error else palette.primary)
-        wrote = True
+        summary_text = summary
+    if summary_text:
+        caption.append(summary_text, style=f"bold {palette.red}" if is_error else palette.primary)
     if elapsed is not None:
         caption.append(f" · {elapsed:.1f}s", style=palette.dim)
-        wrote = True
+
+    # Now add Preview/Full tabs and chip right-aligned
     if shown is not None and not hint_in_summary:
-        if wrote:
-            caption.append("   ", style=palette.dim)
-        # The hint is underlined like a link because that is what it is: a
-        # control, not a label. The arrow says the body below opens.
-        caption.append(hint or body_hint(name), style=f"underline {palette.dim}")
-        caption.append(" ⌄", style=palette.dim)
+        # Preview/Full tabs on same row
+        if total > kept:
+            preview_tab = f"Preview ({kept}/{total})"
+            full_tab = f"Full ({total})"
+        else:
+            preview_tab = ""
+            full_tab = ""
+        hint_text = hint or body_hint(name)
+        # We'll right-align by measuring and padding
+        # Build as a single no_wrap Text with measured padding
+        # Target width: CARD_BODY_WIDTH
+        target_w = CARD_BODY_WIDTH
+        # Current caption length so far
+        left_len = caption.cell_len
+        # Right side: preview_tab (underlined) + "  " + full_tab + "  " + chip_text
+        right_segments = []
+        if preview_tab:
+            right_segments.append((preview_tab, f"underline {palette.dim}"))
+        if full_tab:
+            right_segments.append((full_tab, palette.dim))
+        # Chip: "[Show code ⌄]"
+        chip_text = f"[{hint_text} ⌄]"
+        right_segments.append((chip_text, f"bold {palette.primary} on {palette.dim}"))
+
+        # Compute right length
+        right_len = sum(cell_len(t) for t, _ in right_segments)
+        # Add spacing between segments
+        right_len += 2 * len(right_segments)  # spaces between
+
+        # Padding
+        pad = max(2, target_w - left_len - right_len)
+        caption.append(" " * pad, style=palette.dim)
+
+        # Append right segments
+        for i, (txt, sty) in enumerate(right_segments):
+            if i:
+                caption.append("  ", style=palette.dim)
+            caption.append(txt, style=sty)
+
+    # For hint_in_summary case (collapsed cards from diff_panel etc.)
+    elif hint_in_summary and (hint or shown is None):
+        # Just add the chip hint
+        hint_text = hint or body_hint(name)
+        chip_text = f"[{hint_text} ⌄]"
+        # Right-align
+        target_w = CARD_BODY_WIDTH
+        left_len = caption.cell_len
+        right_len = cell_len(chip_text)
+        pad = max(2, target_w - left_len - right_len)
+        caption.append(" " * pad, style=palette.dim)
+        caption.append(chip_text, style=f"bold {palette.primary} on {palette.dim}")
 
     parts: list[RenderableType] = [head, caption]
+
     if shown is not None:
-        # The body sits in a plain rule-sided frame, as the reference draws it:
-        # a border, no fill, no title. The border is what separates "what the
-        # call printed" from the transcript around it; the card's own rows
-        # already carry the label.
-        parts.append(Text(""))
-        parts.append(Panel(shown, box=box.SQUARE, border_style=palette.dim,
-                           padding=(0, 1)))
+        # Build panel content including the "more lines" row INSIDE the panel
+        panel_content = []
+
+        # Add the shown content
+        panel_content.append(shown)
+
+        # Add "more lines" row inside panel if needed
         if total > kept:
-            # One row, written as a single ``no_wrap`` Text: the hint that
-            # opens the body, then the card's two views on its right edge —
-            # what is on screen is the preview, and the whole body is one
-            # keypress away. Rich restarts a paragraph at every style change,
-            # so this is built with spans rather than a pile of appends, and
-            # ``no_wrap`` is what keeps the tabs from dropping to a row of
-            # their own when the transcript is narrower than the pad assumes.
-            tabs = f"Preview ({kept}/{total})  |  Full ({total})"
-            head = f"  › Show {total - kept} more lines…"
-            # Measured in cells, not characters: the ellipsis is two cells wide
-            # in a terminal and one code point in a string.
-            pad = max(2, CARD_BODY_WIDTH - cell_len(head) - len(tabs))
             more = Text(no_wrap=True)
-            more.append("  ", style=palette.dim)
-            more.append(f"› Show {total - kept} more lines…",
-                        style=f"underline {palette.dim}")
-            more.append(" " * pad, style=palette.dim)
-            more.append(f"Preview ({kept}/{total})", style=palette.dim)
-            more.append("  |  ", style=palette.dim)
-            more.append("Full", style=f"bold {palette.primary}")
-            more.append(f" ({total})", style=palette.dim)
-            parts.append(more)
+            more.append("› Show {} more lines…".format(total - kept), style=f"{palette.dim}")
+            panel_content.append(more)
+
+        # Wrap panel content in a Group/Text then Panel
+        if len(panel_content) == 1:
+            panel_renderable = panel_content[0]
+        else:
+            panel_renderable = Group(*panel_content)
+
+        # ROUNDED border with lifted background
+        lifted = _lifted_bg(palette)
+        panel_style = f"on {lifted}"
+        parts.append(
+            Panel(
+                panel_renderable,
+                box=box.ROUNDED,
+                border_style=palette.dim,
+                padding=(0, 1),
+                style=panel_style,
+            )
+        )
+
+    elif is_collapsed:
+        # Collapsed card: wrap head+caption in a rounded panel
+        # Build a Group of head and caption
+        collapsed_content = Group(head, caption)
+        lifted = _lifted_bg(palette)
+        panel_style = f"on {lifted}"
+        # Replace the parts with a single panel
+        parts = [
+            Panel(
+                collapsed_content,
+                box=box.ROUNDED,
+                border_style=palette.dim,
+                padding=(0, 1),
+                style=panel_style,
+            )
+        ]
+
     return Group(*parts)
 
 
@@ -620,13 +770,16 @@ def _diff_preview(diff: str, palette: Palette, lines: int) -> Text:
     return t
 
 
-def user_prompt_block(text: str, palette: Palette) -> Panel:
-    t = Text()
+def user_prompt_block(text: str, palette: Palette) -> Text:
+    """Render user's turn as a plain bold line with chevron (no box).
+
+    Reference design: "❯ Add a rate limiter to the API client." in bright
+    white bold, no box, no border, no padding.
+    """
+    t = Text(no_wrap=True)
     t.append("❯ ", style=f"bold {palette.accent}")
     t.append(text, style=f"bold {palette.primary}")
-    # Square corners: the prompt is the transcript's one boxed element, and a
-    # rounded panel reads as a notification rather than as the thing you typed.
-    return Panel(t, box=box.SQUARE, border_style=palette.dim, padding=(0, 1))
+    return t
 
 
 def error_block(message: str, palette: Palette) -> Panel:

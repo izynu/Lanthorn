@@ -84,7 +84,8 @@ from .widgets import (SPECIAL_MODES, ChatPane, HeaderBar, LanthornPane,
 #: the ``❯ `` glyph over its first two cells and the placeholder is cut by the
 #: same two cells (see ``PromptInput.render_line``); the lead is what keeps the
 #: hint's first letter from being cut with them.
-_PROMPT_PLACEHOLDER = "  Type a message or / for commands"
+# Reference uses "› Type a message or / for commands..." with chevron and ellipsis
+_PROMPT_PLACEHOLDER = "  › Type a message or / for commands..."
 
 
 #: What `/source-opencode` says while it works. Deliberately no counts: how many
