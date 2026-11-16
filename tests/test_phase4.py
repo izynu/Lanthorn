@@ -1145,7 +1145,7 @@ async def test_ui_rails(wd: Path) -> None:
               app.cfg.display_model in rows[0], rows[0])
         check("footer: the mode is on the first row", "auto" in rows[0], rows[0])
         check("footer: the mode line names the mode",
-              "auto mode" in rows[1], rows[1])
+              "auto mode" in rows[0], rows[0])
         check("footer: the token and cost counters are gone",
               "tok " not in rows[0] and "$ " not in rows[0], rows[0])
 
@@ -1255,8 +1255,11 @@ async def test_termbg(wd: Path) -> None:
         strips = app.screen._compositor.render_strips()
         painted = {c for s in strips for c in row_bgs(s)}
         want = (16, 19, 21)  # #101315
+        # One shade is allowed: the prompt field lifts its fill while empty, so
+        # the placeholder reads as "type here" rather than as more transcript.
+        sheen = (want[0] + 14, want[1] + 14, want[2] + 14)
         check("termbg: every cell is painted in it, edge to edge",
-              painted == {want}, f"{sorted(painted, key=str)}")
+              painted <= {want, sheen}, f"{sorted(painted, key=str)}")
         # The corners are the whole point: that is where the terminal's own
         # rounding curves the padding into view.
         check("termbg: the outer corners are painted too",

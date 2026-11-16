@@ -299,7 +299,18 @@ class RainRichLog(RichLog):
         # record the same renderable twice.
         if self._size_known:
             self._blocks.append((_freeze(content), expand, shrink))
-        return super().write(content, width, expand, shrink, scroll_end, animate)
+        result = super().write(content, width, expand, shrink, scroll_end, animate)
+        # RichLog asks for the end with ``immediate=False``, and Textual clamps
+        # that request to the scroll area it knew *before* this write grew the
+        # virtual size, so a burst of writes lands a few lines short of the
+        # end and the newest line stays below the fold. The end is stated again
+        # against the size the write just set; the request is animated only
+        # when the caller asked for it, and a reader who scrolled up is left
+        # where they are by RichLog's own ``auto_scroll`` check.
+        auto = self.auto_scroll if scroll_end is None else scroll_end
+        if auto:
+            self.scroll_end(animate=animate, immediate=True, x_axis=False)
+        return result
 
     def clear(self) -> None:
         self._blocks.clear()

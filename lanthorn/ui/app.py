@@ -76,8 +76,15 @@ from .complete import CompletionPopup, _iter_files
 from .palette_cmd import CommandPalette, PaletteEntry
 from .rails import LoopRail, TelemetryRail
 from .web import WaveWeb
-from .widgets import (ChatPane, LanthornPane, PromptInput, StatusBar,
-                      _billing_label, _git_branch, _short_cwd)
+from .widgets import (SPECIAL_MODES, ChatPane, HeaderBar, LanthornPane,
+                      PromptInput, StatusBar, _billing_label, _git_branch,
+                      _short_cwd)
+
+#: The empty prompt's hint. It leads with two spaces because the field paints
+#: the ``❯ `` glyph over its first two cells and the placeholder is cut by the
+#: same two cells (see ``PromptInput.render_line``); the lead is what keeps the
+#: hint's first letter from being cut with them.
+_PROMPT_PLACEHOLDER = "  Type a message or / for commands"
 
 
 #: What `/source-opencode` says while it works. Deliberately no counts: how many
@@ -1133,10 +1140,30 @@ class LanthornApp(App):
         width: 100%;
         height: 100%;
     }
+    /* The shell's column. The header, the transcript, the prompt and the
+       footer all sit inside the same measure, so the top rule and the prompt
+       box line up and a wide terminal does not stretch a line of prose across
+       the whole screen. Under the cap it is the full width. */
+    /* Docked, in the same layer as the bottom dock. Textual measures a docked
+       widget against the whole screen, not against what the other docks have
+       already taken, so the two together are over-subscribed: the transcript
+       is a full screen tall and is laid from the top, and it is the bottom
+       dock, which is painted over it, that keeps the transcript's last rows
+       off the screen. The overflow costs nothing on screen — the transcript
+       is a scroll view — and it is the one arrangement in which the header,
+       the transcript and the footer are each given exactly their rows.
+
+       Every child of the screen here is docked, and all of them share this
+       layer: a child on a layer of its own is given a region but is never
+       composited, and a layer whose widgets are not all docked is arranged
+       against the full screen and then pushed down by the docked rows. */
     #main {
         layer: main;
-        width: 100%;
+        width: 1fr;
+        max-width: 132;
         height: 1fr;
+        padding: 0 1;
+        dock: top;
     }
     /* The rails are a display, not the shell: the transcript, the prompt and
        the footer are the whole of the default screen, and the rails are put
@@ -1148,13 +1175,20 @@ class LanthornApp(App):
     /* LanthornPane stays up on a narrow terminal: the operator opened it on
        purpose, and close/minimize/resize are how they put it away. */
     /* A positioner, not a layout: its children are docked to its own bottom
-       edge, and it holds no height of its own so the transcript reaches the
-       prompt's frame. `dock: bottom` + auto height made it lay its children
-       out itself and place every one of them at y=0. */
+       edge. Its height is stated rather than auto because a docked widget with
+       `height: auto` is measured before its children have a region and then
+       collapses, painting them outside itself; 9 rows is the footer's two,
+       the gap, the prompt's three, the focus row and the box's margins. */
+    /* A split bottom widget, not a docked one. A docked widget is measured
+       against the whole screen and the bottom dock then paints over its last
+       nine rows, which puts the live slots docked to the transcript's bottom
+       (the streaming line, the tool card) behind the prompt box where nothing
+       ever draws them. A split widget shortens the area the rest of the
+       screen is laid out in, so the transcript ends exactly where the footer
+       begins. Its children dock to its own edges, as before. */
     #bottom-dock {
-        dock: bottom;
-        height: auto;
-        min-height: 5;
+        split: bottom;
+        height: 9;
         layer: main;
     }
     StatusBar, Input { layer: main; }
@@ -1173,7 +1207,9 @@ class LanthornApp(App):
     #prompt-box {
         dock: bottom;
         height: 3;
-        width: 100%;
+        width: 1fr;
+        max-width: 132;
+        margin: 0 1;
         border: round $secondary;
         background: $background;
     }
@@ -1185,7 +1221,18 @@ class LanthornApp(App):
     }
     #bottom-dock > StatusBar {
         dock: bottom;
-        margin: 0 0 3 0;
+        margin: 0 0 2 0;
+    }
+    /* The header is the screen's first row, docked to the top, and its bottom
+       border is the rule that separates it from the transcript. */
+    /* The header spans the whole shell, so it docks to the top of #main and
+       the transcript, the rails and the pane are laid out under it. It keeps
+       the shell's own padding rather than the row's, so its rule runs edge to
+       edge. */
+    #main > HeaderBar {
+        dock: top;
+        width: 100%;
+        margin: 0 -1;
     }
     /* The box draws the frame; the field's own chrome (border, padding,
        scrollbar row) is reset in PromptInput.DEFAULT_CSS, which outranks this
@@ -1436,9 +1483,19 @@ class LanthornApp(App):
         # RainRichLog) — Textual's compositor does not blend widgets across
         # layers, so a widget on a lower layer would be hidden by the panes.
         # The rails are deliberately crisp: no rain, so the numbers stay legible.
-        # No title row: the splash at the top of the transcript already names
-        # the session, and a second name above it was the only chrome there was.
+        # The header: name, model and directory at the left, the session's
+        # state at the right. It is the first row of #main — not of the
+        # screen — because a child of the screen on its own layer is given a
+        # region but never composited, and a child in the screen's `default`
+        # layer is not composited either. #main docks it to its top edge, the
+        # transcript fills what is left, and the bottom dock takes the last
+        # nine rows of the screen.
+        header = HeaderBar(self.palette)
+        header.set_model(self.cfg.display_model)
+        header.set_cwd(_short_cwd(self.cfg.workdir))
+        header.set_version(__version__)
         with Horizontal(id="main"):
+            yield header
             yield LoopRail(self.palette)
             yield ChatPane(self.palette, rain=self.rain_on)
             yield LanthornPane(self.palette)
@@ -1455,13 +1512,16 @@ class LanthornApp(App):
             # Vertical: Vertical's default 1fr height overrides the box's own
             # `height: 3`, and the dock then arranges it over the footer.
             with Container(id="prompt-box"):
-                yield PromptInput(
-                    placeholder="try \"add a rate limiter to the API client\"",
+                inp = PromptInput(
+                    placeholder=_PROMPT_PLACEHOLDER,
                     id="input")
+                inp.special_mode = self.cfg.mode in SPECIAL_MODES
+                yield inp
             # The footer sits under the prompt, in the order it reads: what
             # this session is, then what mode it is in and what it is doing.
             bar = StatusBar(self.palette)
             bar.mode = self.cfg.mode
+            bar.model = self.cfg.display_model
             bar.unsafe = self.cfg.unsafe
             bar.set_session(session=self.cfg.workdir.name,
                             cwd=_short_cwd(self.cfg.workdir),
@@ -1846,10 +1906,19 @@ class LanthornApp(App):
             # app is tearing down; a missing bar is never fatal.
             return None
 
+    def _header(self) -> HeaderBar | None:
+        try:
+            return self.query_one(HeaderBar)
+        except Exception:
+            return None
+
     def _tick_status(self) -> None:
         bar = self._status_bar()
         if bar is not None:
             bar.render_bar()
+        header = self._header()
+        if header is not None:
+            header.tick()
         self._sample_throughput()
 
     def _tick_spin(self) -> None:
@@ -1863,6 +1932,16 @@ class LanthornApp(App):
         bar = self._status_bar()
         if bar is not None:
             bar.tick_spin()
+        header = self._header()
+        if header is not None:
+            header.tick()
+        try:
+            inp = self.query_one(PromptInput)
+        except Exception:
+            return
+        if inp.special_mode:
+            inp.glyph_phase = (inp.glyph_phase + 0.05) % 1.0
+            inp.refresh()
 
     def _sample_throughput(self) -> None:
         """Feed the waveform a tokens-per-second sample from the token delta.
@@ -1887,9 +1966,11 @@ class LanthornApp(App):
         try:
             self.query_one(LoopRail).tick_pulse()
         except Exception:
-            return
+            pass
         try:
-            self.query_one(ChatPane).card_tick()
+            chat = self.query_one(ChatPane)
+            chat.phase = (chat.phase + 0.12) % 1.0
+            chat.card_tick()
         except Exception:
             pass
         self._drain_phish()
@@ -3036,6 +3117,14 @@ class LanthornApp(App):
         self.cfg.mode = name
         self.agent.set_mode(name)
         self.query_one(StatusBar).set_mode(name)
+        # The glyph says the same thing the footer does: a special mode is
+        # purple, and the glyph is the one place the operator is looking when
+        # they type.
+        try:
+            self.query_one(PromptInput).special_mode = name in SPECIAL_MODES
+            self.query_one(PromptInput).refresh()
+        except Exception:
+            pass
         if name in ("auto-run", "zim"):
             # Re-resolve rather than trusting the launch-time value: a session
             # started in one directory and switched to auto-run from another (or
@@ -6952,6 +7041,11 @@ class LanthornApp(App):
         b = self.query_one(StatusBar)
         b.palette = p
         b.render_bar()
+
+        try:
+            self.query_one(HeaderBar).apply_palette(p)
+        except Exception:
+            pass
 
         # The field itself has no border — the prompt box around it draws the
         # frame — so only its text colour follows the palette here.

@@ -329,6 +329,11 @@ class CompletionPopup(VerticalScroll):
     DEFAULT_CSS = """
     CompletionPopup {
         display: none;
+        /* Floating over the transcript, not inside the dock: the dock is nine
+           rows of footer and prompt, and a list in its flow would push the
+           prompt off the bottom of the screen. Docked to the dock's top edge,
+           it opens upward out of the field, over the transcript. */
+        dock: top;
         height: auto;
         max-height: 10;
         /* The input spans the width, so the popup does too: the list reads as
@@ -456,9 +461,28 @@ class CompletionPopup(VerticalScroll):
         if self.index < 0:
             self.index = 0
         self._paint()
+        # The popup's height is stated from the list, never auto: a docked
+        # widget with an auto height is measured once, when it becomes
+        # visible, and keeps that height when its body changes later, so a
+        # list that grows would be cut off and a list that shrinks would leave
+        # blank rows under it.
+        self.styles.height = len(self.items) + 1
         if not self.has_class("visible"):
             self.add_class("visible")
+            # The height has to be stated again once the popup is on screen:
+            # the styles set while it was hidden are read once, on show, and a
+            # docked widget is not re-measured when its body changes later.
+            self.call_after_refresh(self._fit_height)
         return True
+
+    def _fit_height(self) -> None:
+        """Re-state the height once the popup is on screen.
+
+        Setting it while the popup is still hidden schedules the layout but
+        does not take: the first measurement happens as the widget becomes
+        visible, and it is that measurement's height that stays.
+        """
+        self.styles.height = len(self.items) + 1
 
     # ---- selection --------------------------------------------------------
     @staticmethod
@@ -529,7 +553,11 @@ class CompletionPopup(VerticalScroll):
     # ---- rendering --------------------------------------------------------
     def _paint(self) -> None:
         p = self.palette
-        t = Text()
+        # ``no_wrap``: a description wider than the popup would otherwise wrap
+        # onto a second row and every item after it would sit one row lower
+        # than the height the popup was given for it, which is how the tail of
+        # the list ended up blank.
+        t = Text(no_wrap=True)
         for i, (value, desc) in enumerate(self.items):
             selected = i == self.index
             if self.kind == "file":

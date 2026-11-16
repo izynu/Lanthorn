@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 
 from rich.cells import cell_len, get_character_cell_size
+from rich.console import Group
 from rich.text import Text
 from textual import events
 from textual.containers import Vertical
@@ -12,6 +13,8 @@ from textual.events import Click, MouseDown, MouseMove, MouseUp
 from textual.expand_tabs import expand_tabs_inline
 from textual.geometry import Offset, clamp
 from textual.widgets import Input, Static
+
+from . import gradient
 
 from ..theme import Palette
 from .rain import RainRichLog
@@ -43,6 +46,12 @@ class PromptInput(Input):
     PROMPT = "❯ "
     PROMPT_WIDTH = len(PROMPT)
 
+    #: True when the session is in a mode that runs unattended; the glyph then
+    #: sweeps in the mode's purple. Set by the app on boot and on /mode.
+    special_mode: bool = False
+    #: Position of the glyph's ramp, advanced by the app's fast tick.
+    glyph_phase: float = 0.0
+
     DEFAULT_CSS = """
     PromptInput {
         border: none;
@@ -64,9 +73,10 @@ class PromptInput(Input):
         zero, so shifting the text right would put the caret two cells ahead
         of the character it is editing. Covering the first two cells keeps the
         field's geometry exactly the stock field's, at the cost of the two
-        characters the glyph sits on — which is why the placeholder says "try"
-        and the operator's own text is scrolled only by ``content_width``,
-        two cells narrower, so the end of a long value stays in view.
+        characters the glyph sits on. The placeholder is written with a
+        matching two-character lead so that cut removes only the lead, and the
+        operator's own text is scrolled only by ``content_width``, two cells
+        narrower, so the end of a long value stays in view.
         """
         from rich.segment import Segment
         from rich.style import Style
@@ -96,11 +106,35 @@ class PromptInput(Input):
         # rest of the line is painted edge to edge in the session background
         # (the terminal's, when it reports one), and a glyph with no background
         # would leave two cells of the terminal's padding colour inside the box.
+        from rich.color import Color as RichColor
         from rich.style import Style as RichStyle
 
-        prompt = Segment(self.PROMPT, RichStyle(
-            color=self.accent, bgcolor=self._line_background()))
-        return Strip([prompt] + segments)
+        # The glyph is the one fixed piece of text on screen that is always
+        # "live" — it is where the next thing happens — so it carries a
+        # gradient in the mode colour when the session runs unattended, and
+        # the palette's accent otherwise. Split per character so the ramp is
+        # visible across two cells rather than being one flat colour.
+        bg = self._line_background()
+        # The fill behind the placeholder: the field is the one place a
+        # keystroke goes next, so the empty state is a shade lifted off the
+        # session background rather than the same flat black. Drawn only while
+        # there is no value, so typed text sits on the plain background.
+        if not self.value and bg is not None:
+            lit = bg.triplet
+            lift = tuple(min(255, c + 14) for c in (lit.red, lit.green, lit.blue))
+            sheen_bg = RichColor.from_rgb(*lift)
+            sheen = RichStyle(bgcolor=sheen_bg)
+            segments = [Segment(s.text, (s.style + sheen) if s.style else sheen)
+                        for s in segments]
+            bg = sheen_bg
+        if self.special_mode:
+            colours = gradient.ramp(gradient.AUTO_GRADIENT, len(self.PROMPT),
+                                    phase=self.glyph_phase)
+        else:
+            colours = [self.accent] * len(self.PROMPT)
+        prompt = [Segment(ch, RichStyle(color=col, bgcolor=bg))
+                  for ch, col in zip(self.PROMPT, colours)]
+        return Strip(prompt + segments)
 
     def _line_background(self):
         """The field's resolved background, as a ``rich.color.Color``.
@@ -213,14 +247,49 @@ class PromptInput(Input):
         return clamp(offset, 0, len(self.value))
 
 
+#: Characters of a streaming answer that carry the moving light. Long enough to
+#: read as a highlight travelling through the text, short enough that the
+#: already-written part of a long answer is not all lit.
+STREAM_LIGHT = 24
+
+
+def _light_stream_tail(body: Text, phase: float) -> None:
+    """Light the newest ``STREAM_LIGHT`` characters of a streaming answer.
+
+    The ramp travels *backwards* through the window (newest character darkest,
+    older ones brighter) so the light appears to flow toward the text already
+    written, following the words out of the model — the direction reading
+    moves. A gradient that flowed the other way would pull the eye to the end
+    of the line and fight the cursor sitting there.
+    """
+    n = len(body.plain)
+    window = min(STREAM_LIGHT, n)
+    if window <= 0:
+        return
+    start = n - window
+    for i in range(start, n):
+        pos = (i - start) / max(1, window - 1)
+        col = gradient.gradient_colour(phase + (1.0 - pos) * 0.5, gradient.LIVE_GRADIENT)
+        body.stylize(col, i, i + 1)
+
+
 class ChatPane(Vertical):
     """Scrollable transcript plus the live streaming line."""
 
     DEFAULT_CSS = """
+    /* One scroll view: the transcript. The pane holds it, the live slots and
+       nothing else, and does not scroll itself (`overflow: hidden`) — a pane
+       that scrolled would carry a second scroll offset over the first, and a
+       child that overflows a scroll view is pushed below the scroll area and
+       never painted. */
     ChatPane {
         width: 1fr;
-        height: 100%;
+        height: 1fr;
+        overflow: hidden;
     }
+    /* Undocked children in the pane's own flow, top to bottom: the transcript
+       takes the rest, and the live block (the answer being written, the tool
+       card in flight) sits under it, above the prompt. */
     ChatPane #transcript {
         height: 1fr;
         background: transparent;
@@ -228,7 +297,15 @@ class ChatPane(Vertical):
         scrollbar-color: $secondary;
         scrollbar-background: transparent;
     }
+    /* The live slots are docked to the pane's bottom edge, above the prompt,
+       and the transcript fills what they leave. The answer slot is docked
+       first so it sits nearest the prompt — that is where the words appear —
+       with the reasoning above it and the tool card above that. They are
+       docked rather than left in the pane's flow so their rows are claimed
+       before the transcript's 1fr is measured: an answer that grows does not
+       first overflow the pane and then be re-laid. */
     ChatPane #stream {
+        dock: bottom;
         height: auto;
         max-height: 60%;
         padding: 0 1;
@@ -238,6 +315,7 @@ class ChatPane(Vertical):
         display: none;
     }
     ChatPane #thought {
+        dock: bottom;
         height: auto;
         max-height: 40%;
         padding: 0 1;
@@ -247,6 +325,7 @@ class ChatPane(Vertical):
         display: none;
     }
     ChatPane #card {
+        dock: bottom;
         height: auto;
         padding: 0 1;
         background: transparent;
@@ -381,6 +460,7 @@ class ChatPane(Vertical):
             elapsed=time.monotonic() - c["started"],
             frame=c["frame"],
             targets=c["targets"],
+            phase=self.phase,
         ))
         c["frame"] += 1
 
@@ -520,6 +600,11 @@ class ChatPane(Vertical):
         except Exception:
             return None
 
+    #: Position of the gradient ramp on live text, 0..1. Advanced by the app's
+    #: fast tick so the light travels at a steady speed however often deltas
+    #: arrive; set_stream and set_reasoning only read it.
+    phase: float = 0.0
+
     def set_stream(self, text: str) -> None:
         from .markdown import markdown_text
 
@@ -533,8 +618,14 @@ class ChatPane(Vertical):
         # Markdown is resolved anyway, so the half-written answer reads as
         # prose rather than as its own source while it streams.
         body = markdown_text(text, self.palette).copy()
+        # The newest characters are lit with a moving ramp, so the eye lands
+        # where the writing is. Only the tail: the gradient says "this is
+        # arriving", and everything older has already arrived. Done on the
+        # resolved Text rather than the source, so a code span or a bold run
+        # in the tail keeps its colouring and the light passes over it.
+        _light_stream_tail(body, self.phase)
         cursor = "▊" if self._cursor_on else " "
-        body.append(cursor, style=f"bold {self.palette.accent}")
+        body.append(cursor, style=f"bold {gradient.gradient_colour(self.phase, gradient.LIVE_GRADIENT)}")
         w.update(body)
 
     def clear_stream(self) -> None:
@@ -591,7 +682,8 @@ class ChatPane(Vertical):
             return
         w.remove_class("hidden")
         cursor = "▊" if self._cursor_on else " "
-        w.update(reasoning_live(text, self.palette, cursor))
+        body = reasoning_live(text, self.palette, cursor, phase=self.phase)
+        w.update(body)
 
     def clear_reasoning(self) -> None:
         w = self._thought_widget()
@@ -602,18 +694,189 @@ class ChatPane(Vertical):
 
     def flash_cursor(self) -> None:
         self._cursor_on = not self._cursor_on
+        # Advance the live-text gradient on the same 0.55s clock the cursor
+        # blinks on. One timer for both keeps the light and the caret in step,
+        # and the app only has to repaint the slot once per tick.
+        self.phase = (self.phase + 0.12) % 1.0
+
+
+class HeaderBar(Static):
+    """The top row: what this shell is, what it is pointed at, and whether it
+    is free.
+
+    One line of text and a rule under it, the way a terminal multiplexer's
+    status line reads: the mark and the name at the left, the model and the
+    directory in the middle, and the session's state at the right. It is
+    chrome, so it is quiet — grey on the background, one rule under it to
+    separate it from the transcript, and colour only in the state word, which
+    is the one thing on the row that changes while the session runs.
+
+    The rule is a second row drawn by the widget rather than a CSS border: a
+    one-row widget with a bottom border is handed a region one row shorter
+    than the border needs, and the border eats the only row it has.
+
+    The directory is shed first when the row is too narrow for all of it: the
+    model is what the session is doing the work with, and the name is what the
+    shell is. If the row still does not fit, the middle drops entirely and the
+    state keeps its place at the right edge, because "busy" or "ready" is the
+    fact that must never be scrolled off.
+    """
+
+    DEFAULT_CSS = """
+    HeaderBar {
+        height: 2;
+        padding: 0 1;
+        background: $background;
+    }
+    """
+
+    def __init__(self, palette: Palette, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.palette = palette
+        self.model = ""
+        self.cwd = ""
+        self.version = ""
+        #: "ready", "busy" or "error" — the state word at the right.
+        self.state = "ready"
+        self.state_note = ""
+        self._phase = 0.0
+
+    def set_model(self, model: str) -> None:
+        self.model = model
+        self.update(self.render())
+
+    def set_cwd(self, cwd: str) -> None:
+        self.cwd = cwd
+        self.update(self.render())
+
+    def set_version(self, version: str) -> None:
+        self.version = version
+        self.update(self.render())
+
+    def set_state(self, state: str, note: str = "") -> None:
+        """*state* is "ready", "busy" or "error"; *note* replaces the word."""
+        self.state = state
+        self.state_note = note
+        self.update(self.render())
+
+    def tick(self) -> None:
+        """Advance the gradient phase. Only a busy state has anything moving."""
+        if self.state != "busy":
+            return
+        self._phase = (self._phase + 0.06) % 1.0
+        self.update(self.render())
+
+    def render_row(self) -> Text:
+        p = self.palette
+        width = self.size.width or 100
+        left = Text(no_wrap=True)
+        # The header row, as the reference draws it: the mark, the name, the
+        # version in its own bracket, then the model and directory separated by
+        # a bar. The brackets are not decoration: they are what tells the eye
+        # which part of the row is a label and which is a value.
+        left.append("✳ ", style=p.dim)
+        left.append("Lanthorn", style=f"bold {p.primary}")
+        if self.version:
+            left.append(" ", style=p.dim)
+            left.append(f"[v{self.version}]", style=p.dim)
+
+        mid_parts: list[tuple[str, str]] = []
+        if self.model:
+            mid_parts.append((f"◇ {self.model}", p.dim))
+        if self.cwd:
+            mid_parts.append((f"📁 {self.cwd}", p.dim))
+
+        right = Text(no_wrap=True)
+        if self.state == "busy":
+            # The state word carries the travelling gradient: this is the one
+            # place on the row that says work is happening, and the motion is
+            # the whole point of putting it here.
+            label = self.state_note or "Working"
+            dot = gradient.gradient_colour(self._phase, gradient.LIVE_GRADIENT)
+            right.append("◉ ", style=f"bold {dot}")
+            right.append_text(gradient.paint(
+                label, gradient.LIVE_GRADIENT, phase=self._phase,
+                period=max(8, len(label))))
+        elif self.state == "error":
+            right.append("◉ ", style=f"bold {p.red}")
+            right.append(self.state_note or "Error", style=f"bold {p.red}")
+        else:
+            right.append("◉ ", style=f"bold {p.accent}")
+            word = self.state_note or "Ready"
+            # The ready pill: the word on a lifted background, so the right
+            # edge of the header reads as a state rather than as more text.
+            # Inverted text, not a painted background: the screen's own
+            # background is the theme's, and the terminal-background test
+            # requires every cell to keep it.
+            right.append(f" {word} ", style=f"bold reverse {p.primary}")
+
+        sep = "  │  "
+        gap = "   "
+        row = Text(no_wrap=True)
+        row.append_text(left)
+
+        def middle(parts: list[tuple[str, str]]) -> Text:
+            t = Text(no_wrap=True)
+            for n, (text, style) in enumerate(parts):
+                t.append(sep if n else gap, style=p.dim)
+                t.append(text, style=style)
+            return t
+
+        budget = width - 2  # the bar's own horizontal padding
+        mid = middle(mid_parts)
+        # Fit by measurement: the cwd goes first, then the model, then the
+        # whole middle. The right-hand state is never shed.
+        while mid_parts and row.cell_len + mid.cell_len + len(gap) + right.cell_len > budget:
+            mid_parts.pop()
+            mid = middle(mid_parts)
+        row.append_text(mid)
+        if row.cell_len + len(gap) + right.cell_len <= budget:
+            row.append(" " * max(len(gap), budget - row.cell_len - right.cell_len),
+                       style=p.dim)
+            row.append_text(right)
+        else:
+            row.append_text(right)
+        return row
+
+    def render(self) -> Group:
+        """The status line, then the rule under it, edge to edge."""
+        p = self.palette
+        width = self.size.width or 100
+        rule = Text("─" * width, style=p.dim, no_wrap=True)
+        return Group(self.render_row(), rule)
+
+    def refresh_row(self) -> None:
+        self.update(self.render())
+
+    def on_mount(self) -> None:
+        self.update(self.render())
+
+    def on_resize(self) -> None:
+        self.update(self.render())
+
+    def apply_palette(self, palette: Palette) -> None:
+        self.palette = palette
+        self.update(self.render())
+
+
+#: Modes whose label is drawn as a gradient. These are the modes that run
+#: unattended: the sweep is a standing warning that this shell will act
+#: without asking, and it is the reason the colour is a *mode* colour rather
+#: than a palette one — it means the same thing in every theme.
+SPECIAL_MODES = frozenset({"auto", "auto-run", "danger", "uncensored", "blackhat"})
 
 
 class StatusBar(Static):
-    """The footer under the prompt: what this session is, and what mode it is in.
+    """The footer under the prompt: what is happening, in what mode, and the
+    keys that change it.
 
-    Two rows, in the shape the operator asked for. The first is the session
-    facts, pipe-separated: model, session name, directory, git branch, mode.
-    The second is the mode line: what the mode does, the switch hint, and the
-    live activity readout (the spinner and what the agent is doing now).
+    Two rows. The first is the live readout: the spinner and what the agent is
+    doing now, then the mode — a gradient label in the modes that run
+    unattended — then the safety badges. The second is the shortcut row,
+    right-aligned: `/help`, `/model`, `/tools`.
 
-    The token, cost, turn and iteration counters are not here. They were the
-    loudest row on the screen and the least often read; they live in the
+    The session's facts (model, directory, branch) are in the header at the
+    top of the screen. The token, cost, turn and iteration counters are in the
     telemetry rail and `/cost`. Nothing that moves faster than a thought
     belongs in the frame around the prompt.
     """
@@ -650,6 +913,9 @@ class StatusBar(Static):
         self.cwd = ""
         self.branch = ""
         self.mode = "auto"
+        #: The model this shell will call. Set by the app; shown beside the
+        #: mode in the footer.
+        self.model = ""
         #: Scope badge and whether the guard is armed. A security fact, so it
         #: is never the field the footer sheds.
         self.scope_text = "off"
@@ -670,6 +936,10 @@ class StatusBar(Static):
         #: is waiting on the upstream, or the bar looks frozen for as long as
         #: the request takes.
         self._spin_frame = 0
+        #: Position of the mode label's gradient, advanced by the fast tick so
+        #: the sweep moves even while the session is idle: a special mode is
+        #: always in effect, so its label always reads as live.
+        self._mode_phase = 0.0
 
     # ---- setters ----------------------------------------------------------
     def set_activity(self, activity: str, busy: bool = False,
@@ -680,6 +950,14 @@ class StatusBar(Static):
         if not busy:
             self._note = ""
         self.render_bar()
+        # The header's state word follows the same source, so there is one
+        # place that decides whether this shell is working and two places
+        # that show it.
+        try:
+            header = self.app.query_one(HeaderBar)
+        except Exception:
+            return
+        header.set_state("busy" if busy else "ready", activity if busy else "")
 
     def note(self, text: str) -> None:
         """Show *text* in the footer for :data:`NOTE_SECONDS`, then revert."""
@@ -727,7 +1005,14 @@ class StatusBar(Static):
             self._note = ""
             self.render_bar()
             return
+        if self.mode in SPECIAL_MODES:
+            self._mode_phase = (self._mode_phase + 0.04) % 1.0
+            moving = True
+        else:
+            moving = False
         if not self.busy or self.hold:
+            if moving:
+                self.render_bar()
             return
         self._spin_frame += 1
         self.render_bar()
@@ -759,46 +1044,29 @@ class StatusBar(Static):
 
         Separate from :meth:`render_bar` so the rows can be read — and
         measured against the bar's width — without painting them.
+
+        Row one is the readout: what is happening, then the mode. Row two is
+        the shortcuts: what the operator can type, right-aligned the way a
+        shell's help line is. The session's facts (model, directory, branch)
+        live in the header at the top of the screen, not here — one fact in
+        one place, and the footer keeps its two rows for the things that
+        change.
         """
         p = self.palette
         from ..config import MODES
 
         m = MODES.get(self.mode, {})
-        sep = ("   ·   ", p.dim)
+        # The reference footer's separators: a thin rule, not a dot. The bar is
+        # a row of facts, and a rule reads as a boundary between them where a
+        # dot reads as punctuation in a sentence.
+        sep = ("  │  ", p.dim)
         label = str(m.get("label", self.mode.upper())).lower()
 
-        # ---- row one: the session facts ----------------------------------
-        # Built as a list so the over-long fields can be shed by measured fit:
-        # the directory goes first (the session name is already there), and the
-        # branch next — while the mode, which says what tools may run
-        # unattended, is never dropped.
-        head = Text()
-        head.append(self.model, style=p.dim)
-        if self.session:
-            head.append(*sep)
-            head.append(self.session, style=p.dim)
-        tail: list[tuple[str, object]] = []
-        if self.branch:
-            tail.append((self.branch, p.dim))
-        if self.cwd:
-            tail.append((self.cwd, p.dim))
-        tail.append((label, p.primary))
-
-        limit = self.size.width or 200
-        while True:
-            row = head.copy()
-            for text, style in tail:
-                row.append(*sep)
-                row.append(str(text), style=style)
-            if row.cell_len <= limit or len(tail) <= 1:
-                break
-            tail.pop(0)  # shed the cwd, then the branch
-
-        # ---- row two: what is happening, then how to change it -----------
+        # ---- row one: what is happening, then the mode -------------------
         # The readout comes first and the mode second: the moving thing sits
         # at a fixed column instead of being pushed around by the length of
         # the mode's label.
-        line = Text()
+        line = Text(no_wrap=True)
         if self._note:
             line.append(self._note, style=p.primary)
         elif self.hold:
@@ -811,26 +1079,80 @@ class StatusBar(Static):
         elif self.busy:
             from .renderers import SPINNER_FRAMES
             spin = SPINNER_FRAMES[self._spin_frame % len(SPINNER_FRAMES)]
-            line.append(f"{spin} {self.activity}", style=p.primary)
+            # The working readout is the second thing allowed to move: a
+            # spinner alone reads as a frozen frame at a glance, and the sweep
+            # is what says "the model is still writing".
+            lit = f"{spin} {self.activity}"
+            line.append_text(gradient.paint(
+                lit, gradient.LIVE_GRADIENT,
+                phase=(self._spin_frame * 0.13) % 1.0,
+                period=max(10, len(lit))))
         else:
-            line.append(f"● {self.activity}", style=p.dim)
+            # The reference footer's idle word: ``● Idle``, not ``● idle``.
+            line.append(f"● {self.activity[:1].upper()}{self.activity[1:]}", style=p.dim)
         line.append(*sep)
-        line.append(f"{label} mode", style=p.primary)
+        # What the shell is: the model it will call. It changes with /model, so
+        # it belongs beside the mode rather than in the header alone.
+        line.append("◇ ", style=p.dim)
+        line.append(self.model, style=p.primary)
+        line.append(*sep)
+        line.append_text(self.mode_text(label))
+        line.append(*sep)
+        # Scope is a guard, and the footer states it every frame: on is a quiet
+        # check, off is a red word, because a shell with no scope is the one
+        # fact the operator must never have to go looking for.
         if self.unsafe:
-            line.append(*sep)
             line.append("sandbox off", style=f"bold {p.red}")
-        elif not self.scope_ok:
-            line.append(*sep)
-            line.append(f"scope {self.scope_text}", style=f"bold {p.red}")
+        elif self.scope_ok:
+            line.append("◎ scope on", style=p.dim)
+        else:
+            line.append(f"◎ scope {self.scope_text or 'off'}", style=f"bold {p.red}")
 
-        # ``no_wrap``: the rows are already shed to fit, and a word-wrap in the
-        # footer turns a tight row into three and pushes the prompt off the
-        # screen at a narrow width.
+        # ---- row two: the shortcuts, right-aligned ------------------------
+        keys = Text(no_wrap=True)
+        for n, (key, what) in enumerate(self.SHORTCUTS):
+            if n:
+                # A bar between the commands, not a pipe: the footer is a
+                # shell's status line, and the bar is what the header uses
+                # between its own fields.
+                keys.append("  │  ", style=p.dim)
+            keys.append(key, style=p.primary)
+        limit = self.size.width or 200
+        pad = max(0, limit - 2 - keys.cell_len)
+        second = Text(no_wrap=True)
+        second.append(" " * pad)
+        second.append_text(keys)
+
         t = Text(no_wrap=True)
-        t.append_text(row)
-        t.append("\n")
         t.append_text(line)
+        t.append(chr(10))
+        t.append_text(second)
         return t
+
+    #: The footer's shortcut row. Plain text, no emoji: these are commands to
+    #: type, and the footer is the last place to teach a key you did not bind.
+    SHORTCUTS: tuple[tuple[str, str], ...] = (
+        ("/help", "keys and commands"),
+        ("/model", "switch model"),
+        ("/tools", "what it can do"),
+    )
+
+    def mode_text(self, label: str) -> Text:
+        """The mode label. A special mode is a gradient; the rest are plain.
+
+        "auto" is the one mode that changes what the agent may do without
+        asking, so it is the one that gets the sweep — a colour that means
+        "this shell is running unattended". Every other mode is a word in the
+        primary colour, and the gated ones keep their red safety badges where
+        they are.
+        """
+        p = self.palette
+        text = f"{label} mode"
+        if self.mode in SPECIAL_MODES:
+            return gradient.paint(text, gradient.AUTO_GRADIENT,
+                                  phase=self._mode_phase,
+                                  period=max(8, len(text)), style="bold")
+        return Text(text, style=p.primary)
 
     def on_mount(self) -> None:
         self.render_bar()

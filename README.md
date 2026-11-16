@@ -34,6 +34,12 @@ keeps going until the job is done — while you watch it work.
 
 <img src="docs/screenshots/02-shell.png" alt="the Lanthorn shell — transcript with a live tool card, prompt, footer" width="880">
 
+<img src="docs/screenshots/05-session.png" alt="a finished turn — read, diff and test cards, then the summary line" width="880">
+
+*One turn, end to end: the read and its framed preview, the edit and its diff,
+the test run and its output, then the line that says it is done. Special modes
+carry a gradient label, and whatever is still running carries a moving one.*
+
 *A transcript that streams and a tool card that shows the call while it runs.
 The default view is plain: the session at the top, the work in the middle, the
 prompt and two grey footer lines at the bottom. The rails that keep the loop
@@ -348,6 +354,24 @@ will restart the checkout under you on the next launch.
 --list-models
 --version
 ```
+
+### The screen
+
+One screen, three bands: the header (mark, version, model, directory, state), the
+transcript, and the footer (activity, model, mode, scope, then the shortcuts). The
+prompt box sits under the footer.
+
+- **Tool cards.** A call is a head row (`● Read(src/api/client.py)`), a caption
+  (`└ Read 128 lines   Show code ⌄`), and the body in a thin frame. The body is a
+  three-line preview; a longer one ends in `› Show 125 more lines…` with
+  `Preview (3/128) | Full (128)` on the right of that row. Edits show `N changes`,
+  a test run shows `9 passed (0.31s)`.
+- **Gradients.** Only two things carry a moving colour: the mode label of a mode
+  that runs unattended (`auto mode`, purple sweep), and whatever is live right now
+  — the answer being written, the reasoning line, the running tool card, the prompt
+  glyph. Static text never glows.
+- **Slash commands.** Typing `/` opens the list above the prompt; `↑↓` move, `tab`
+  accepts, `esc` closes. `@` opens the file list the same way.
 
 ### Panes
 

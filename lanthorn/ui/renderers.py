@@ -5,12 +5,15 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
+from rich import box
 from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.syntax import Syntax
+from rich.cells import cell_len
 from rich.text import Text
 
 from ..theme import TOOL_ICONS, Palette
+from . import gradient
 from .markdown import markdown_line, markdown_text
 
 # ---------------------------------------------------------------------------
@@ -103,6 +106,31 @@ def _mono_theme(palette: Palette):
 # ---------------------------------------------------------------------------
 # Tool panels
 # ---------------------------------------------------------------------------
+#: How a tool is named in a card's first row. The Claude Code spelling, because
+#: it is the one a reader of a coding agent's transcript already knows: a verb
+#: with its argument in brackets, not an uppercase tag.
+TOOL_VERBS = {
+    "read_file": "Read",
+    "write_file": "Write",
+    "edit_file": "Update",
+    "list_dir": "List",
+    "glob": "Glob",
+    "grep": "Grep",
+    "bash": "Bash",
+    "web_search": "Search",
+    "web_fetch": "Fetch",
+    "todo": "Todo",
+    "agent": "Agent",
+    "task": "Task",
+    "generate_image": "Image",
+}
+
+
+def tool_verb(name: str) -> str:
+    """The verb a card's first row shows for *name*."""
+    return TOOL_VERBS.get(name, name.replace("_", " ").title())
+
+
 def _header(name: str, args: dict, palette: Palette, status: str = "",
             max_len: int | None = 200, tag: str = "",
             tag_color: str = "") -> Text:
@@ -155,22 +183,9 @@ def _detail(name: str, args: dict, max_len: int | None = 200) -> str:
     return ""
 
 
-def tool_call_panel(name: str, args: dict, palette: Palette) -> Panel:
-    """Panel shown when a tool is *requested*."""
-    body = Text()
-    if name == "bash":
-        body.append(_detail("bash", args), style=palette.primary)
-    elif name in {"write_file", "edit_file"}:
-        body.append(_detail(name, args), style=palette.accent)
-    else:
-        body.append(_detail(name, args), style=palette.accent)
-    return Panel(
-        body,
-        title=_header(name, args, palette),
-        title_align="left",
-        border_style=palette.dim,
-        padding=(0, 1),
-    )
+def tool_call_panel(name: str, args: dict, palette: Palette) -> Group:
+    """The card for a tool that has been *requested* but not yet answered."""
+    return tool_card(name, args, palette, summary="requested", preview_lines=0)
 
 
 def _tool_body(name: str, args: dict, output: str,
@@ -181,13 +196,15 @@ def _tool_body(name: str, args: dict, output: str,
         lang = detect_lang_for_command(args.get("command", ""))
         return hacker_syntax(output, lang, palette, line_numbers=False)
     if name == "read_file":
+        # A read is shown as the file it read: line numbers down the side, so
+        # the body reads as a listing rather than as loose output.
         lang = lang_for_path(args.get("path", ""))
-        return hacker_syntax(output, lang, palette, line_numbers=False)
+        return hacker_syntax(output, lang, palette, line_numbers=True)
     return render_output_text(output, palette)
 
 
 def _exit_badge(meta: dict, palette: Palette) -> Text:
-    """The right-hand status chip on a bash panel."""
+    """The right-hand status chip on a bash panel (used by the hunt view)."""
     exit_code = meta.get("exit")
     if meta.get("timeout"):
         return Text(" TIMEOUT ", style=f"bold white on {palette.amber}")
@@ -198,6 +215,46 @@ def _exit_badge(meta: dict, palette: Palette) -> Text:
     return Text(f" EXIT {exit_code} ", style=f"bold white on {palette.red}")
 
 
+def _result_summary(name: str, args: dict, output: str, meta: dict,
+                    is_error: bool) -> str:
+    """The card caption for a finished call: what came back, in a few words.
+
+    Derived from the output rather than asked of the tool: the agent's tool
+    layer reports an exit code and a diff, and the one number a reader wants
+    from a read is how many lines it got.
+    """
+    meta = meta or {}
+    if name == "bash":
+        code = meta.get("exit")
+        if meta.get("timeout"):
+            return "Timed out"
+        if code not in (None, 0) or is_error:
+            return f"exit {code if code is not None else 'error'}"
+        # What a test run says when it passes: ``9 passed (0.31s)``. The last
+        # line of a test runner's output is that summary; when the command
+        # was not one, the exit status is the honest answer.
+        last = next((ln.strip() for ln in reversed(output.splitlines())
+                     if ln.strip()), "")
+        if re.search(r"\b\d+ passed\b", last):
+            # ``9 passed in 0.31s`` reads as the reference's ``9 passed (0.31s)``.
+            return last.replace(" in ", " (", 1) + ("" if "(" in last else ")")
+        return "exit 0"
+    if name == "read_file":
+        lines = output.count(chr(10)) + (1 if output.strip() else 0)
+        return f"Read {lines} lines"
+    if name == "list_dir":
+        entries = len([ln for ln in output.splitlines() if ln.strip()])
+        return f"{entries} entries"
+    if name in {"grep", "glob"}:
+        hits = len([ln for ln in output.splitlines() if ln.strip()])
+        return f"{hits} matches"
+    if name in {"write_file", "edit_file"}:
+        return "written"
+    if is_error:
+        return "failed"
+    return "done"
+
+
 def tool_result_panel(
     name: str,
     args: dict,
@@ -205,29 +262,14 @@ def tool_result_panel(
     palette: Palette,
     is_error: bool = False,
     meta: dict | None = None,
-) -> Panel:
-    """Panel shown when a tool *finishes*, with syntax-highlighted output."""
+) -> Group:
+    """A finished tool call, as a card: summary row, result caption, preview."""
     meta = meta or {}
-    border = palette.red if is_error else palette.dim
     body = _tool_body(name, args, output, palette)
-
-    if name == "bash":
-        return Panel(
-            body,
-            title=_header(name, args, palette),
-            subtitle=_exit_badge(meta, palette),
-            subtitle_align="right",
-            title_align="left",
-            border_style=border,
-            padding=(0, 1),
-        )
-
-    return Panel(
-        body,
-        title=_header(name, args, palette),
-        title_align="left",
-        border_style=border,
-        padding=(0, 1),
+    return tool_card(
+        name, args, palette,
+        summary=_result_summary(name, args, output, meta, is_error),
+        body=body, is_error=is_error,
     )
 
 
@@ -240,48 +282,35 @@ def hunt_tool_panel(
     color: str = "",
     is_error: bool = False,
     meta: dict | None = None,
-) -> Panel:
-    """One finished tool call from a hunt worker, rendered in full.
+) -> Group:
+    """One finished tool call from a hunt worker, as a card.
 
-    Same treatment a normal turn gives a call — the operator's real view of the
-    engagement — with two differences that matter when ten agents run at once:
+    Same treatment a normal turn gives a call, with two differences that matter
+    when ten agents run at once:
 
     * the command is **never truncated**. A recon or exploitation one-liner is
       routinely 200+ characters and the part that says what is being tested is
-      at the end of it, not the beginning. It goes in the *body*, not the
-      title: a Rich panel title is one line and gets clipped at the border, so
-      a long command there is exactly the truncation this exists to remove.
-    * the agent's name is in the title. Interleaved, unattributed panels would
-      be unreadable, and attributing them is what lets the operator follow one
-      thread through the noise.
+      at the end of it. It is the card's own detail line, unbounded — a
+      truncated command is exactly the thing this exists to avoid.
+    * the agent's name is in the first row. Interleaved, unattributed cards
+      would be unreadable, and attributing them is what lets the operator
+      follow one thread through the noise.
     """
     meta = meta or {}
-    border = palette.red if is_error else palette.dim
-
-    if name == "bash":
-        # The full command leads, then a blank line, then the output — so the
-        # two are never mistaken for each other. Group rather than one Text:
-        # the output half is a Syntax renderable, which cannot be appended to.
-        cmd = Text(_detail("bash", args, max_len=None), style=palette.primary)
-        body: RenderableType = Group(
-            cmd, Text(""), _tool_body(name, args, output, palette)
-        )
-        return Panel(
-            body,
-            title=_header(name, {}, palette, tag=agent, tag_color=color),
-            subtitle=_exit_badge(meta, palette),
-            subtitle_align="right",
-            title_align="left",
-            border_style=border,
-            padding=(0, 1),
-        )
-
-    return Panel(
-        _tool_body(name, args, output, palette),
-        title=_header(name, args, palette, tag=agent, tag_color=color),
-        title_align="left",
-        border_style=border,
-        padding=(0, 1),
+    detail = _detail(name, args, max_len=None)
+    if detail.startswith("$ "):
+        # The body shows the command too; the row shows the bare command so
+        # the card does not read ``Bash($ for p in ...)``.
+        detail = detail[2:]
+    return tool_card(
+        name, args, palette,
+        tag=agent, tag_color=color,
+        detail=detail,
+        summary=_exit_badge(meta, palette),
+        body=_tool_body(name, args, output, palette),
+        is_error=is_error,
+        preview_lines=CARD_PREVIEW_LINES * 3,
+        hint_in_summary=True,
     )
 
 
@@ -296,32 +325,34 @@ def tool_running_panel(
     elapsed: float = 0.0,
     frame: int = 0,
     targets: list[str] | None = None,
-) -> Panel:
+    phase: float | None = None,
+) -> Group:
     """The *live* card for a tool that is still running.
 
-    Same shape as :func:`tool_call_panel`, but the border is lit and the title
-    carries a spinner and a running clock, so a slow command is visibly in
-    flight rather than indistinguishable from a hung one.
+    Same shape as a finished card's summary row, with three differences that
+    say "in flight": the verb and its argument carry the travelling gradient,
+    the caption carries a spinner and a running clock, and the scope targets
+    (the hosts a command names) sit under it. A slow command is then visibly
+    working rather than indistinguishable from a hung one.
     """
-    body = Text()
-    body.append(_detail(name, args), style=palette.primary if name == "bash" else palette.accent)
+    if phase is None:
+        phase = (frame * 0.11) % 1.0
+    # No elapsed clock here: the footer already carries the running time of
+    # the whole turn, and two clocks counting the same work read as two
+    # different jobs.
+    card = tool_card(name, args, palette, phase=phase,
+                     summary=f"{_SPINNER[frame % len(_SPINNER)]} running",
+                     preview_lines=0)
+    parts: list[RenderableType] = [card]
     if targets:
         # The hosts the command names, read straight off the command text. This
         # is the same best-effort scan the scope guard uses — shown, not
         # enforced, because the gate is unreachable in the shipped modes.
-        body.append("\n")
-        body.append("⌖ ", style=palette.dim)
-        body.append(", ".join(targets), style=palette.amber)
-
-    spin = _SPINNER[frame % len(_SPINNER)]
-    status = f"{spin} {elapsed:.1f}s"
-    return Panel(
-        body,
-        title=_header(name, args, palette, status=status),
-        title_align="left",
-        border_style=palette.accent,
-        padding=(0, 1),
-    )
+        t = Text()
+        t.append("  ⌖ ", style=palette.dim)
+        t.append(", ".join(targets), style=palette.amber)
+        parts.append(t)
+    return Group(*parts)
 
 
 def turn_marker(turn: int, palette: Palette, width: int = 58) -> Text:
@@ -355,49 +386,247 @@ def render_output_text(output: str, palette: Palette) -> Text:
     return t
 
 
-def diff_panel(path: str, diff: str, palette: Palette, verb: str = "EDIT") -> Panel:
-    """Render a unified diff with green adds / red removes."""
+#: Lines of a card's body shown when it is collapsed. Three is the most that
+#: still reads as a preview rather than a panel: enough to see the shape of a
+#: diff or the first rows of a test run, few enough that a transcript of twenty
+#: tool calls stays scannable.
+CARD_PREVIEW_LINES = 3
+
+#: Width a card's rows are laid out to: the transcript's 132-column cap
+#: (``#main`` in the app) less its two cells of padding and the frame's own two.
+#: The tab strip therefore lands on the card's right edge at the widest the
+#: transcript ever gets; on a narrower one it stops short, which reads as a tab
+#: strip that has not reached the edge rather than one that has wrapped.
+CARD_BODY_WIDTH = 126
+
+
+def body_hint(name: str) -> str:
+    """The "Show code" / "Show diff" / "Show output" hint for a card."""
+    if name in {"read_file", "write_file", "edit_file"}:
+        return "Show code"
+    if name in {"grep", "glob", "list_dir"}:
+        return "Show results"
+    return "Show output"
+
+
+def _body_lines(body: RenderableType) -> int:
+    return len(_plain_of(body).plain.splitlines()) or 1
+
+
+def _plain_of(body: RenderableType) -> Text:
+    """The body's text, whichever renderable it is.
+
+    A ``Syntax`` keeps its source on ``.code`` and its ``__str__`` is only the
+    object's repr, which is why this looks inside rather than calling ``str``:
+    a preview built from a repr showed ``<rich.syntax.Syntax object at ...>``.
+    """
+    if isinstance(body, Text):
+        return body
+    code = getattr(body, "code", None)
+    if isinstance(code, str):
+        return Text(code)
+    try:
+        return Text(str(body))
+    except Exception:
+        return Text()
+
+
+def _preview_of(body: RenderableType, lines: int) -> Text:
+    """The first *lines* lines of a body, as a Text.
+
+    A non-Text body (a Syntax, a Group) is previewed as plain text rather than
+    highlighted: the preview is a glance, and highlighting three lines costs a
+    pygments run per card for no reading benefit.
+    """
+    rows = _plain_of(body).plain.splitlines()
+    if len(rows) <= lines:
+        return Text(chr(10).join(rows))
+    return Text(chr(10).join(rows[:lines]))
+
+
+
+def tool_card(name: str, args: dict, palette: Palette, *,
+              summary: str | Text = "", detail: str = "", preview: Text | None = None,
+              body: RenderableType | None = None,
+              preview_lines: int = CARD_PREVIEW_LINES,
+              is_error: bool = False, phase: float | None = None,
+              tag: str = "", tag_color: str = "", verb: str = "",
+              elapsed: float | None = None, hint_in_summary: bool = False,
+              hint: str = "") -> Group:
+    """One tool call, as Claude Code draws it: a compact summary row, then the
+    body.
+
+    The shape, top to bottom::
+
+        ● read_file(src/api/client.py)
+          Read 128 lines  ·  Show code
+
+              1  from __future__ import annotations
+              2  import time
+              3  ...
+             … 125 more lines
+
+    * The first row is the call: a status glyph, the tool's verb in lower case,
+      and its argument in brackets. It is what the eye scans when it is looking
+      for "what did it do", so it carries no decoration.
+    * The second row is the result: a joint, what came back, and the hint that
+      opens the body. It is grey and indented, so the call reads as the heading
+      and the result as its caption.
+    * The body is a preview of ``preview_lines`` lines, then a dim "… N more
+      lines" row when the body is longer. A card is a summary of a call, not the
+      call's whole output.
+
+    ``phase`` is the gradient ramp position while the tool is still running:
+    the verb and its argument sweep, which is what "this is happening now"
+    looks like in a transcript that is otherwise still. ``verb`` overrides the
+    tool name (an edit shows "update"); ``elapsed`` adds a running clock to the
+    summary row for a live card.
+    """
+    shown = preview if preview is not None else (
+        _preview_of(body, preview_lines) if body is not None else None)
+    total = _body_lines(body) if body is not None else 0
+    kept = _body_lines(shown) if shown is not None else 0
+
+    arg = detail or _detail(name, args)
+    head = Text()
+    if is_error:
+        head.append("● ", style=f"bold {palette.red}")
+    elif phase is not None:
+        head.append("● ", style=f"bold {gradient.gradient_colour(phase, gradient.LIVE_GRADIENT)}")
+    else:
+        head.append("● ", style=f"bold {palette.accent}")
+    if tag:
+        head.append(f"[{tag}] ", style=f"bold {tag_color or palette.accent}")
+    label = (verb or tool_verb(name))
+    if phase is not None:
+        lit = label + "(" + arg + ")"
+        head.append_text(gradient.paint(lit, gradient.LIVE_GRADIENT, phase=phase,
+                                        period=max(8, len(lit))))
+    else:
+        head.append(label, style=f"bold {palette.primary}")
+        head.append("(", style=palette.dim)
+        # The argument is the line's one piece of colour: it is what the call
+        # acts on, and in a column of cards it is the thing being scanned for.
+        head.append(arg, style=palette.accent)
+        head.append(")", style=palette.dim)
+
+    # The caption hangs off the head's glyph, the way a tree's second line hangs
+    # off its first: ``└`` under the ``●``, then what came back.
+    caption = Text(no_wrap=True)
+    caption.append("  └ ", style=palette.dim)
+    wrote = False
+    if isinstance(summary, Text):
+        caption.append_text(summary)
+        wrote = True
+    elif summary:
+        caption.append(summary, style=f"bold {palette.red}" if is_error else palette.primary)
+        wrote = True
+    if elapsed is not None:
+        caption.append(f" · {elapsed:.1f}s", style=palette.dim)
+        wrote = True
+    if shown is not None and not hint_in_summary:
+        if wrote:
+            caption.append("   ", style=palette.dim)
+        # The hint is underlined like a link because that is what it is: a
+        # control, not a label. The arrow says the body below opens.
+        caption.append(hint or body_hint(name), style=f"underline {palette.dim}")
+        caption.append(" ⌄", style=palette.dim)
+
+    parts: list[RenderableType] = [head, caption]
+    if shown is not None:
+        # The body sits in a plain rule-sided frame, as the reference draws it:
+        # a border, no fill, no title. The border is what separates "what the
+        # call printed" from the transcript around it; the card's own rows
+        # already carry the label.
+        parts.append(Text(""))
+        parts.append(Panel(shown, box=box.SQUARE, border_style=palette.dim,
+                           padding=(0, 1)))
+        if total > kept:
+            # One row, written as a single ``no_wrap`` Text: the hint that
+            # opens the body, then the card's two views on its right edge —
+            # what is on screen is the preview, and the whole body is one
+            # keypress away. Rich restarts a paragraph at every style change,
+            # so this is built with spans rather than a pile of appends, and
+            # ``no_wrap`` is what keeps the tabs from dropping to a row of
+            # their own when the transcript is narrower than the pad assumes.
+            tabs = f"Preview ({kept}/{total})  |  Full ({total})"
+            head = f"  › Show {total - kept} more lines…"
+            # Measured in cells, not characters: the ellipsis is two cells wide
+            # in a terminal and one code point in a string.
+            pad = max(2, CARD_BODY_WIDTH - cell_len(head) - len(tabs))
+            more = Text(no_wrap=True)
+            more.append("  ", style=palette.dim)
+            more.append(f"› Show {total - kept} more lines…",
+                        style=f"underline {palette.dim}")
+            more.append(" " * pad, style=palette.dim)
+            more.append(f"Preview ({kept}/{total})", style=palette.dim)
+            more.append("  |  ", style=palette.dim)
+            more.append("Full", style=f"bold {palette.primary}")
+            more.append(f" ({total})", style=palette.dim)
+            parts.append(more)
+    return Group(*parts)
+
+
+def diff_panel(path: str, diff: str, palette: Palette, verb: str = "EDIT") -> Group:
+    """An edit, as a card: summary row, then the diff's head.
+
+    A diff's whole point is its shape, so the preview is longer than a read's
+    and keeps its red/green; additions and removals still have to be readable
+    at a glance.
+    """
+    added = sum(1 for line in diff.splitlines()
+                if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in diff.splitlines()
+                  if line.startswith("-") and not line.startswith("---"))
+    preview = _diff_preview(diff, palette, CARD_PREVIEW_LINES * 4)
+    return tool_card(
+        "edit_file", {"path": path}, palette,
+        verb="Update" if verb.upper() != "WRITE" else "Write", detail=path,
+        # The reference's caption: how many changes, not a +n -n score. The
+        # counts are still in the diff itself for anyone who opens it.
+        summary=f"{_change_count(added, removed)}",
+        preview=preview,
+        body=Text(diff),
+        tag="",
+        hint="Show diff",
+    )
+
+
+def _change_count(added: int, removed: int) -> str:
+    """``1 change`` / ``2 changes`` for a diff's caption."""
+    changes = added + removed
+    return f"{changes} change" if changes == 1 else f"{changes} changes"
+
+
+def _diff_preview(diff: str, palette: Palette, lines: int) -> Text:
     t = Text()
-    added = removed = 0
-    for i, line in enumerate(diff.splitlines()):
-        if i:
-            t.append("\n")
+    shown = 0
+    for line in diff.splitlines():
+        if shown >= lines:
+            break
         if line.startswith("+++") or line.startswith("---"):
-            t.append(line, style=f"bold {palette.primary}")
-        elif line.startswith("@@"):
-            t.append(line, style=f"bold {palette.accent}")
+            continue
+        if shown:
+            t.append("\n")
+        if line.startswith("@@"):
+            t.append(line, style=f"bold {palette.dim}")
         elif line.startswith("+"):
             t.append(line, style=palette.accent)
-            added += 1
         elif line.startswith("-"):
             t.append(line, style=palette.red)
-            removed += 1
         else:
             t.append(line, style=palette.dim)
-
-    title = Text()
-    title.append(f"[ ± {verb} ]", style=f"bold {palette.primary}")
-    title.append("  " + path, style=palette.accent)
-    subtitle = Text()
-    subtitle.append(f"+{added} ", style=palette.accent)
-    subtitle.append(f"-{removed}", style=palette.red)
-
-    return Panel(
-        t,
-        title=title,
-        title_align="left",
-        subtitle=subtitle,
-        subtitle_align="right",
-        border_style=palette.dim,
-        padding=(0, 1),
-    )
+        shown += 1
+    return t
 
 
 def user_prompt_block(text: str, palette: Palette) -> Panel:
     t = Text()
     t.append("❯ ", style=f"bold {palette.accent}")
     t.append(text, style=f"bold {palette.primary}")
-    return Panel(t, border_style=palette.primary, padding=(0, 1))
+    # Square corners: the prompt is the transcript's one boxed element, and a
+    # rounded panel reads as a notification rather than as the thing you typed.
+    return Panel(t, box=box.SQUARE, border_style=palette.dim, padding=(0, 1))
 
 
 def error_block(message: str, palette: Palette) -> Panel:
@@ -456,7 +685,8 @@ def banner_renderable(palette: Palette, revealed: int | None = None) -> Text:
 THINK_LIVE_LINES = 14
 
 
-def reasoning_live(text: str, palette: Palette, cursor: str = "") -> Text:
+def reasoning_live(text: str, palette: Palette, cursor: str = "",
+                   phase: float | None = None) -> Text:
     """The cheap, per-delta form of in-flight reasoning: the last few lines.
 
     Called once per ``reasoning_delta``, so it does no markdown parse — a
@@ -477,6 +707,16 @@ def reasoning_live(text: str, palette: Palette, cursor: str = "") -> Text:
         if i:
             t.append("\n")
         t.append(line, style=f"italic {palette.dim}")
+    if phase is not None:
+        # The newest characters of the thinking carry the same travelling
+        # light as the answer, so "the model is working" reads as motion at
+        # the point of writing rather than as a label somewhere else.
+        n = len(t.plain)
+        window = min(24, n)
+        for i in range(n - window, n):
+            pos = (i - (n - window)) / max(1, window - 1)
+            t.stylize(gradient.gradient_colour(phase + pos * 0.5, gradient.LIVE_GRADIENT),
+                      i, i + 1)
     if cursor:
         t.append(cursor, style=f"bold {palette.accent}")
     return t
