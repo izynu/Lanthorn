@@ -202,7 +202,7 @@ Working on Lanthorn itself, you want the checkout you edit to be the one that
 runs. Same launcher, without the clone step:
 
 ```bash
-git clone <this-repo> ~/lanthorn && cd ~/lanthorn
+git clone https://github.com/izynu/Lanthorn.git ~/lanthorn && cd ~/lanthorn
 python3 -m venv .venv && pip install -r requirements.txt
 ./setup.sh                          # verify the route end-to-end
 ./run.sh                            # launch, no activation

@@ -339,7 +339,8 @@ def test_wiring(tmp: Path) -> None:
           '("/effort", "raise or lower how hard the model thinks", "effort")'
           in app_src)
     check("wiring: the palette names /tokenjuice-api-setup",
-          '"/tokenjuice-api-setup", "your own Token Juice key' in app_src)
+          '"/tokenjuice-api-setup", "store or remove your own Token Juice key"'
+          in app_src)
     check("wiring: /effort answers while busy", "effort" in LanthornApp.BUSY_OK)
     check("wiring: /tokenjuice-api-setup answers while busy",
           "tokenjuice-api-setup" in LanthornApp.BUSY_OK)
